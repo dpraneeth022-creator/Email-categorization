@@ -117,15 +117,17 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   const [visibleListCount, setVisibleListCount] = useState(100);
   const [copiedCampusLink, setCopiedCampusLink] = useState(false);
 
+  const PUBLIC_CAMPUS_URL = 'https://email-categorization-tbkl.onrender.com';
   const isInternalPreviewContainer =
     typeof window !== 'undefined' && /^https?:\/\/ais-(dev|pre)-/i.test(window.location.origin);
 
   const handleCopyCampusLink = async () => {
-    if (typeof window === 'undefined' || !window.location?.origin || isInternalPreviewContainer) {
-      return;
-    }
+    if (typeof window === 'undefined') return;
+    const shareUrl = isInternalPreviewContainer
+      ? PUBLIC_CAMPUS_URL
+      : window.location?.origin || PUBLIC_CAMPUS_URL;
     try {
-      await navigator.clipboard.writeText(window.location.origin);
+      await navigator.clipboard.writeText(shareUrl);
       setCopiedCampusLink(true);
       setTimeout(() => setCopiedCampusLink(false), 2000);
     } catch {
@@ -413,25 +415,23 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
 
       {/* Share & Sign Out Footer */}
       <div className="p-3 border-t border-slate-200 space-y-1">
-        {!isInternalPreviewContainer && (
-          <button
-            type="button"
-            onClick={handleCopyCampusLink}
-            className="w-full px-2.5 py-2 rounded-lg flex items-center gap-2.5 text-xs font-medium text-slate-600 hover:text-slate-950 hover:bg-slate-100 transition-colors cursor-pointer"
-          >
-            {copiedCampusLink ? (
-              <>
-                <Check className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
-                <span className="text-emerald-700">Campus link copied</span>
-              </>
-            ) : (
-              <>
-                <Share2 className="w-3.5 h-3.5 shrink-0" />
-                <span>Copy campus link</span>
-              </>
-            )}
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={handleCopyCampusLink}
+          className="w-full px-2.5 py-2 rounded-lg flex items-center gap-2.5 text-xs font-medium text-slate-600 hover:text-slate-950 hover:bg-slate-100 transition-colors cursor-pointer"
+        >
+          {copiedCampusLink ? (
+            <>
+              <Check className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+              <span className="text-emerald-700">Campus link copied</span>
+            </>
+          ) : (
+            <>
+              <Share2 className="w-3.5 h-3.5 shrink-0" />
+              <span>Copy campus link</span>
+            </>
+          )}
+        </button>
         <button
           type="button"
           onClick={onSignOut}

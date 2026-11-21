@@ -2,7 +2,6 @@ import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
   signInWithPopup,
-  signInWithRedirect,
   getRedirectResult,
   browserPopupRedirectResolver,
   GoogleAuthProvider,
@@ -45,11 +44,6 @@ function isInsideIframe(): boolean {
   } catch {
     return true;
   }
-}
-
-function isMobileBrowser(): boolean {
-  if (typeof navigator === 'undefined') return false;
-  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 }
 
 function buildGoogleProvider(forceConsent: boolean, primaryDomain = 'rvce.edu.in'): GoogleAuthProvider {
@@ -121,7 +115,7 @@ export const initGoogleAuth = (
 };
 
 /**
- * Completes a standalone mobile redirect sign-in if returning from Google OAuth.
+ * Checks for any pending Firebase redirect result if applicable.
  * Skipped inside iframes where only popup sign-in is supported.
  */
 export const checkGoogleRedirectResult = async (
@@ -129,6 +123,7 @@ export const checkGoogleRedirectResult = async (
 ): Promise<{ user: User; accessToken: string } | null> => {
   if (isInsideIframe()) return null;
   try {
+    isSigningIn = true;
     const result = await getRedirectResult(auth, browserPopupRedirectResolver);
     if (!result) return null;
 
@@ -151,6 +146,8 @@ export const checkGoogleRedirectResult = async (
     return { user: result.user, accessToken: cachedAccessToken };
   } catch (error) {
     throw new Error(formatFirebaseAuthError(error));
+  } finally {
+    isSigningIn = false;
   }
 };
 
@@ -168,12 +165,9 @@ export const googleSignIn = async (
     const primaryDomain = allowedDomains[0] || 'rvce.edu.in';
     const provider = buildGoogleProvider(forceConsent, primaryDomain);
 
-    // On standalone mobile browsers (outside an iframe), redirect flow avoids mobile popup-close disconnects
-    if (!isInsideIframe() && isMobileBrowser()) {
-      await signInWithRedirect(auth, provider, browserPopupRedirectResolver);
-      return null;
-    }
-
+    // Always use signInWithPopup on both mobile and desktop:
+    // Modern Chrome/Safari partition third-party storage across Render (*.onrender.com) and
+    // Firebase (*.firebaseapp.com), which breaks signInWithRedirect and loops back to login.
     const result = await signInWithPopup(auth, provider, browserPopupRedirectResolver);
 
     // Strictly enforce college-only email addresses

@@ -9,6 +9,8 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22.18.0"
+      - key: APP_URL
+        value: "https://email-categorization-tbkl.onrender.com"
       - key: CAMPUS_ALLOWED_DOMAINS
         value: "rvce.edu.in"
       - key: GEMINI_API_KEY

@@ -205,10 +205,15 @@ function getAiClient(): GoogleGenAI {
   });
 }
 
-function getAppBaseUrl(): string {
-  const raw = process.env.APP_URL?.trim();
+function getAppBaseUrl(req?: express.Request): string {
+  const raw = process.env.APP_URL?.trim() || process.env.RENDER_EXTERNAL_URL?.trim();
   if (raw && raw !== 'MY_APP_URL') {
     return raw.replace(/\/+$/, '');
+  }
+  const host = req?.get('host');
+  if (host) {
+    const proto = req?.protocol || 'https';
+    return `${proto}://${host}`.replace(/\/+$/, '');
   }
   return `http://localhost:${PORT}`;
 }
@@ -560,6 +565,10 @@ function checkCampusAiRateLimit(email: string): boolean {
 async function createServer() {
   const app = express();
   app.set('trust proxy', 1);
+  app.use((_req, res, next) => {
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    next();
+  });
   app.use(express.json({ limit: '50mb' }));
 
   app.get('/api/health', (_req, res) => {
@@ -570,8 +579,8 @@ async function createServer() {
     });
   });
 
-  app.get('/api/auth/providers', (_req, res) => {
-    const baseUrl = getAppBaseUrl();
+  app.get('/api/auth/providers', (req, res) => {
+    const baseUrl = getAppBaseUrl(req);
     res.json({
       campus: {
         allowedDomains: ALLOWED_CAMPUS_DOMAINS,
