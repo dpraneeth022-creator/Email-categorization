@@ -1,11 +1,21 @@
-{
-  "projectId": "gen-lang-client-0468049517",
-  "appId": "1:597384294936:web:8d26cf6ba175de086a896d",
-  "apiKey": "AIzaSyC3kae2OZ5Ca8bUof-vBHlGask5FtevWNU",
-  "authDomain": "gen-lang-client-0468049517.firebaseapp.com",
-  "storageBucket": "gen-lang-client-0468049517.firebasestorage.app",
-  "messagingSenderId": "597384294936",
-  "measurementId": "",
-  "oAuthClientId": "597384294936-7v72ok7t2m3libffjdhk8gob6hqkctek.apps.googleusercontent.com",
-  "recaptchaSiteKey": ""
-}
+// Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+import { getAnalytics } from "firebase/analytics";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+
+// Your web app's Firebase configuration
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyCJdwWNkKvzHW04OUcOn_HWMgzRAnFFGRg",
+  authDomain: "nexaai-1086a.firebaseapp.com",
+  projectId: "nexaai-1086a",
+  storageBucket: "nexaai-1086a.firebasestorage.app",
+  messagingSenderId: "52879983860",
+  appId: "1:52879983860:web:f261dd736a2236dea88aa1",
+  measurementId: "G-ZR3LW2PEQW"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
