@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nexamail-campus
+    runtime: node
+    plan: free
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: NODE_ENV=production npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22.18.0"
+      - key: CAMPUS_ALLOWED_DOMAINS
+        value: "rvce.edu.in"
+      - key: GEMINI_API_KEY
+        sync: false

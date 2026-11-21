@@ -1,0 +1,8 @@
+{
+  "name": "Remix NexaMAIL",
+  "description": "AI-powered multi-provider mail workspace that connects Gmail, Outlook, and Yahoo to automatically sort Academic Mails, Volunteering Mails, and custom trained categories.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
