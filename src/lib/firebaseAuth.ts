@@ -305,8 +305,14 @@ export function formatFirebaseAuthError(error: unknown): string {
       return 'The Google sign-in popup closed before finishing. If Google showed "Access blocked", the OAuth app needs Workspace Internal mode under @rvce.edu.in (for unlimited campus access) or your email added under Test users.';
     case 'auth/cancelled-popup-request':
       return 'Another sign-in window was already open. Close any open popups and click Sign in with Google once.';
-    case 'auth/unauthorized-domain':
-      return 'This domain is not authorized for Google Sign-In yet. Add it under Firebase Console → Authentication → Settings → Authorized domains.';
+    case 'auth/unauthorized-domain': {
+      const host =
+        typeof window !== 'undefined' && window.location?.hostname
+          ? window.location.hostname
+          : 'this domain';
+      const proj = firebaseConfig.projectId || 'your Firebase project';
+      return `"${host}" is not authorized yet for Firebase project "${proj}". Add "${host}" under Firebase Console → ${proj} → Authentication → Settings → Authorized domains.`;
+    }
     case 'auth/operation-not-allowed':
       return 'Google Sign-In is not enabled on this Firebase project.';
     case 'auth/network-request-failed':
