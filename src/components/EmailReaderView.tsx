@@ -14,22 +14,27 @@ import {
   Maximize2,
   Minimize2,
   Paperclip,
+  RefreshCw,
 } from 'lucide-react';
 import { decodeHtmlEntities } from '../shared/classifierRules';
-import type { MailAttachment, MailMessage } from '../shared/types';
+import type { ClassificationRule, MailAttachment, MailMessage } from '../shared/types';
 
 interface EmailReaderViewProps {
   message: MailMessage;
+  rules: ClassificationRule[];
   currentIndex: number;
   totalCount: number;
   isExpanded: boolean;
   isLoadingFullBody?: boolean;
+  isReclassifying?: boolean;
   onBackMobile: () => void;
   onToggleExpand: () => void;
   onSelectPrevious: () => void;
   onSelectNext: () => void;
   onToggleReadState: (messageId: string, unread: boolean) => void;
   onDownloadAttachment: (message: MailMessage, attachment: MailAttachment) => Promise<void>;
+  onManualReclassifyMessage: (message: MailMessage) => void;
+  onManualMoveMessage: (messageId: string, targetCategoryId: string) => void;
 }
 
 function formatFullDate(iso: string): string {
@@ -174,16 +179,20 @@ function renderLinkifiedText(text: string): React.ReactNode[] {
 
 export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
   message,
+  rules,
   currentIndex,
   totalCount,
   isExpanded,
   isLoadingFullBody = false,
+  isReclassifying = false,
   onBackMobile,
   onToggleExpand,
   onSelectPrevious,
   onSelectNext,
   onToggleReadState,
   onDownloadAttachment,
+  onManualReclassifyMessage,
+  onManualMoveMessage,
 }) => {
   const hasHtml = Boolean(message.bodyHtml && message.bodyHtml.trim().length > 0);
   const [iframeHeight, setIframeHeight] = useState<number>(420);
@@ -357,6 +366,35 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          <label className="sr-only" htmlFor="reader-move-category">
+            Move email to mailbox
+          </label>
+          <select
+            id="reader-move-category"
+            value={message.classification?.categoryId || 'general'}
+            onChange={(e) => onManualMoveMessage(message.id, e.target.value)}
+            title="Move email to another mailbox"
+            className="h-8 max-w-[128px] px-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:border-slate-300 rounded-lg focus:outline-none focus:border-blue-600 transition-colors cursor-pointer"
+          >
+            {rules.map((rule) => (
+              <option key={rule.id} value={rule.id}>
+                {rule.shortName}
+              </option>
+            ))}
+            <option value="general">General</option>
+          </select>
+
+          <button
+            type="button"
+            onClick={() => onManualReclassifyMessage(message)}
+            disabled={isReclassifying}
+            className="h-8 px-2.5 text-xs font-medium text-slate-700 hover:text-slate-950 hover:bg-slate-100 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+            title="Re-classify this email"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isReclassifying ? 'animate-spin' : ''}`} />
+            <span className="hidden lg:inline">{isReclassifying ? 'Classifying...' : 'Re-classify'}</span>
+          </button>
+
           <button
             type="button"
             onClick={() => onToggleReadState(message.id, !message.unread)}

@@ -4,6 +4,9 @@ import {
   signInWithPopup,
   getRedirectResult,
   browserPopupRedirectResolver,
+  browserLocalPersistence,
+  browserSessionPersistence,
+  setPersistence,
   GoogleAuthProvider,
   onAuthStateChanged,
   type User,
@@ -14,8 +17,26 @@ import {
   buildCampusRestrictionError,
   isAllowedCampusEmail,
 } from '../shared/campusPolicy';
+import type { ConnectedAccount } from '../shared/types';
 
 export const GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
+
+const PERSISTED_SESSION_KEY = 'nexamail_persisted_session_v1';
+const PERSISTED_TOKEN_KEY = 'nexamail_gmail_token_v1';
+const DEFAULT_TOKEN_TTL_MS = 55 * 60 * 1000; // 55 minutes conservative default for 1h Google OAuth token
+const TOKEN_EXPIRY_BUFFER_MS = 30 * 1000;
+
+export interface PersistedSession {
+  account: ConnectedAccount;
+  keepSignedIn: boolean;
+  lastSyncedAt: number;
+}
+
+interface PersistedGmailToken {
+  email: string;
+  accessToken: string;
+  expiresAt: number;
+}
 
 // Supports optional VITE_FIREBASE_* env overrides when deploying under an @rvce.edu.in Workspace project
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {};
@@ -34,9 +55,194 @@ const firebaseConfig = {
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
 
-// Track sign-in transition and keep OAuth access token strictly in memory.
+// In-memory state synced with localStorage when "Keep me signed in" is enabled
 let isSigningIn = false;
 let cachedAccessToken: string | null = null;
+let cachedTokenExpiresAt = 0;
+
+function safeLocalStorage(): Storage | null {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      return window.localStorage;
+    }
+  } catch {
+    // Ignore restricted storage environments
+  }
+  return null;
+}
+
+export function loadPersistedSession(
+  allowedDomains: readonly string[] = DEFAULT_ALLOWED_CAMPUS_DOMAINS
+): PersistedSession | null {
+  const storage = safeLocalStorage();
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(PERSISTED_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PersistedSession>;
+    if (!parsed?.keepSignedIn || !parsed.account?.email) return null;
+    if (!isAllowedCampusEmail(parsed.account.email, allowedDomains)) {
+      storage.removeItem(PERSISTED_SESSION_KEY);
+      storage.removeItem(PERSISTED_TOKEN_KEY);
+      return null;
+    }
+    return {
+      account: parsed.account,
+      keepSignedIn: true,
+      lastSyncedAt: Number(parsed.lastSyncedAt) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function savePersistedSession(
+  account: ConnectedAccount,
+  keepSignedIn: boolean,
+  lastSyncedAt?: number
+): void {
+  const storage = safeLocalStorage();
+  if (!storage) return;
+  try {
+    if (!keepSignedIn) {
+      storage.removeItem(PERSISTED_SESSION_KEY);
+      storage.removeItem(PERSISTED_TOKEN_KEY);
+      return;
+    }
+    const existing = loadPersistedSession();
+    const payload: PersistedSession = {
+      account,
+      keepSignedIn: true,
+      lastSyncedAt: lastSyncedAt ?? existing?.lastSyncedAt ?? Date.now(),
+    };
+    storage.setItem(PERSISTED_SESSION_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore quota errors
+  }
+}
+
+export function updatePersistedLastSync(lastSyncedAt: number): void {
+  const storage = safeLocalStorage();
+  if (!storage) return;
+  try {
+    const existing = loadPersistedSession();
+    if (!existing) return;
+    storage.setItem(
+      PERSISTED_SESSION_KEY,
+      JSON.stringify({
+        ...existing,
+        lastSyncedAt,
+      })
+    );
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function clearPersistedSession(): void {
+  const storage = safeLocalStorage();
+  if (!storage) return;
+  try {
+    storage.removeItem(PERSISTED_SESSION_KEY);
+    storage.removeItem(PERSISTED_TOKEN_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function storeGmailToken(
+  email: string,
+  accessToken: string,
+  expiresInSeconds?: number,
+  persistInLocalStorage = true
+): number {
+  const ttlMs =
+    expiresInSeconds && Number.isFinite(expiresInSeconds) && expiresInSeconds > 60
+      ? Math.max(60_000, (expiresInSeconds - 60) * 1000)
+      : DEFAULT_TOKEN_TTL_MS;
+  const expiresAt = Date.now() + ttlMs;
+
+  cachedAccessToken = accessToken;
+  cachedTokenExpiresAt = expiresAt;
+
+  const storage = safeLocalStorage();
+  if (storage) {
+    try {
+      if (persistInLocalStorage) {
+        const record: PersistedGmailToken = {
+          email: email.trim().toLowerCase(),
+          accessToken,
+          expiresAt,
+        };
+        storage.setItem(PERSISTED_TOKEN_KEY, JSON.stringify(record));
+      } else {
+        storage.removeItem(PERSISTED_TOKEN_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  return expiresAt;
+}
+
+export function getGmailAccessToken(expectedEmail?: string): string | null {
+  const now = Date.now();
+  if (cachedAccessToken && now < cachedTokenExpiresAt - TOKEN_EXPIRY_BUFFER_MS) {
+    return cachedAccessToken;
+  }
+
+  // Hydrate valid non-expired token from localStorage if available
+  const storage = safeLocalStorage();
+  if (storage) {
+    try {
+      const raw = storage.getItem(PERSISTED_TOKEN_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<PersistedGmailToken>;
+        const matchesEmail =
+          !expectedEmail ||
+          !parsed.email ||
+          parsed.email.toLowerCase() === expectedEmail.trim().toLowerCase();
+        if (
+          matchesEmail &&
+          parsed.accessToken &&
+          typeof parsed.expiresAt === 'number' &&
+          now < parsed.expiresAt - TOKEN_EXPIRY_BUFFER_MS
+        ) {
+          cachedAccessToken = parsed.accessToken;
+          cachedTokenExpiresAt = parsed.expiresAt;
+          return cachedAccessToken;
+        }
+      }
+    } catch {
+      // Ignore malformed storage
+    }
+  }
+
+  cachedAccessToken = null;
+  cachedTokenExpiresAt = 0;
+  return null;
+}
+
+export function isGmailTokenExpired(expectedEmail?: string): boolean {
+  return !getGmailAccessToken(expectedEmail);
+}
+
+/**
+ * Clears ONLY the expired/revoked Gmail OAuth token without signing the user out or clearing cached mail.
+ */
+export function invalidateGmailAccessToken(): void {
+  cachedAccessToken = null;
+  cachedTokenExpiresAt = 0;
+  const storage = safeLocalStorage();
+  if (storage) {
+    try {
+      storage.removeItem(PERSISTED_TOKEN_KEY);
+    } catch {
+      // Ignore
+    }
+  }
+}
 
 function isInsideIframe(): boolean {
   try {
@@ -46,15 +252,23 @@ function isInsideIframe(): boolean {
   }
 }
 
-function buildGoogleProvider(forceConsent: boolean, primaryDomain = 'rvce.edu.in'): GoogleAuthProvider {
+function buildGoogleProvider(
+  forceConsent: boolean,
+  primaryDomain = 'rvce.edu.in',
+  loginHint?: string
+): GoogleAuthProvider {
   const provider = new GoogleAuthProvider();
   for (const scope of GMAIL_SCOPES) {
     provider.addScope(scope);
   }
-  provider.setCustomParameters({
+  const params: Record<string, string> = {
     hd: primaryDomain,
-    prompt: forceConsent ? 'consent select_account' : 'select_account',
-  });
+    prompt: forceConsent ? 'consent select_account' : loginHint ? 'none' : 'select_account',
+  };
+  if (loginHint) {
+    params.login_hint = loginHint;
+  }
+  provider.setCustomParameters(params);
   return provider;
 }
 
@@ -94,7 +308,8 @@ export const initGoogleAuth = (
   return onAuthStateChanged(auth, (user: User | null) => {
     if (user) {
       if (!isAllowedCampusEmail(user.email, allowedDomains)) {
-        cachedAccessToken = null;
+        invalidateGmailAccessToken();
+        clearPersistedSession();
         if (!isSigningIn) {
           void auth.signOut();
           onAuthFailure?.();
@@ -102,10 +317,10 @@ export const initGoogleAuth = (
         return;
       }
 
-      if (cachedAccessToken) {
-        onAuthSuccess?.(user, cachedAccessToken);
+      const validToken = getGmailAccessToken(user.email || undefined);
+      if (validToken) {
+        onAuthSuccess?.(user, validToken);
       } else if (!isSigningIn) {
-        cachedAccessToken = null;
         if (onCachedUserSession) {
           onCachedUserSession(user);
         } else {
@@ -113,8 +328,13 @@ export const initGoogleAuth = (
         }
       }
     } else {
-      cachedAccessToken = null;
-      onAuthFailure?.();
+      // Never force sign-out if a valid "Keep me signed in" local session exists;
+      // user can still read their IndexedDB cache and reconnect Gmail whenever needed.
+      const persisted = loadPersistedSession(allowedDomains);
+      if (!persisted) {
+        invalidateGmailAccessToken();
+        onAuthFailure?.();
+      }
     }
   });
 };
@@ -133,22 +353,25 @@ export const checkGoogleRedirectResult = async (
     if (!result) return null;
 
     if (!isAllowedCampusEmail(result.user.email, allowedDomains)) {
-      cachedAccessToken = null;
+      invalidateGmailAccessToken();
+      clearPersistedSession();
       await auth.signOut();
       throw new Error(buildCampusRestrictionError(result.user.email, allowedDomains));
     }
 
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
-      cachedAccessToken = null;
+      invalidateGmailAccessToken();
       await auth.signOut();
       throw new Error(
         'Sign-in succeeded, but Gmail read permission was not granted. Please sign in again and allow Gmail access.'
       );
     }
 
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
+    const tokenResp = (result as unknown as { _tokenResponse?: { oauthExpireIn?: number } })
+      ._tokenResponse;
+    storeGmailToken(result.user.email || '', credential.accessToken, tokenResp?.oauthExpireIn, true);
+    return { user: result.user, accessToken: credential.accessToken };
   } catch (error) {
     throw new Error(formatFirebaseAuthError(error));
   } finally {
@@ -158,7 +381,9 @@ export const checkGoogleRedirectResult = async (
 
 export const googleSignIn = async (
   forceConsent = false,
-  allowedDomains: readonly string[] = DEFAULT_ALLOWED_CAMPUS_DOMAINS
+  allowedDomains: readonly string[] = DEFAULT_ALLOWED_CAMPUS_DOMAINS,
+  keepSignedIn = true,
+  loginHint?: string
 ): Promise<{
   user: User;
   accessToken: string;
@@ -167,32 +392,84 @@ export const googleSignIn = async (
 
   try {
     isSigningIn = true;
-    const primaryDomain = allowedDomains[0] || 'rvce.edu.in';
-    const provider = buildGoogleProvider(forceConsent, primaryDomain);
 
-    // Always use signInWithPopup on both mobile and desktop:
-    // Modern Chrome/Safari partition third-party storage across Render (*.onrender.com) and
-    // Firebase (*.firebaseapp.com), which breaks signInWithRedirect and loops back to login.
-    const result = await signInWithPopup(auth, provider, browserPopupRedirectResolver);
+    // Configure Firebase persistence based on "Keep me signed in"
+    try {
+      await setPersistence(
+        auth,
+        keepSignedIn ? browserLocalPersistence : browserSessionPersistence
+      );
+    } catch {
+      // Proceed cleanly if browser restricts persistence switching
+    }
+
+    const primaryDomain = allowedDomains[0] || 'rvce.edu.in';
+    // Only use prompt: 'none' when reconnecting a known account; fallback to select_account if interactive needed
+    let result;
+    if (loginHint && !forceConsent) {
+      try {
+        const hintProvider = buildGoogleProvider(false, primaryDomain, loginHint);
+        result = await signInWithPopup(auth, hintProvider, browserPopupRedirectResolver);
+      } catch (silentErr) {
+        const code = (silentErr as { code?: string } | null)?.code;
+        if (code === 'auth/popup-blocked' || code === 'auth/popup-closed-by-user') {
+          throw silentErr;
+        }
+        const interactiveProvider = buildGoogleProvider(false, primaryDomain);
+        interactiveProvider.setCustomParameters({
+          hd: primaryDomain,
+          login_hint: loginHint,
+          prompt: 'select_account',
+        });
+        result = await signInWithPopup(auth, interactiveProvider, browserPopupRedirectResolver);
+      }
+    } else {
+      const provider = buildGoogleProvider(forceConsent, primaryDomain);
+      if (loginHint) {
+        provider.setCustomParameters({
+          hd: primaryDomain,
+          login_hint: loginHint,
+          prompt: forceConsent ? 'consent select_account' : 'select_account',
+        });
+      }
+      result = await signInWithPopup(auth, provider, browserPopupRedirectResolver);
+    }
 
     // Strictly enforce college-only email addresses
     if (!isAllowedCampusEmail(result.user.email, allowedDomains)) {
-      cachedAccessToken = null;
+      invalidateGmailAccessToken();
+      clearPersistedSession();
       await auth.signOut();
       throw new Error(buildCampusRestrictionError(result.user.email, allowedDomains));
     }
 
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
-      cachedAccessToken = null;
+      invalidateGmailAccessToken();
       await auth.signOut();
       throw new Error(
         'College Google sign-in succeeded, but Gmail read permission was not granted. Click Sign in with Google again and check the Gmail permission box.'
       );
     }
 
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
+    const tokenResp = (result as unknown as { _tokenResponse?: { oauthExpireIn?: number } })
+      ._tokenResponse;
+    storeGmailToken(
+      result.user.email || '',
+      credential.accessToken,
+      tokenResp?.oauthExpireIn,
+      keepSignedIn
+    );
+
+    const connectedAccount: ConnectedAccount = {
+      provider: 'gmail',
+      email: result.user.email || 'campus-user',
+      displayName: result.user.displayName || result.user.email || 'Campus User',
+      photoUrl: result.user.photoURL || undefined,
+    };
+    savePersistedSession(connectedAccount, keepSignedIn);
+
+    return { user: result.user, accessToken: credential.accessToken };
   } catch (error) {
     const code = (error as { code?: string } | null)?.code;
     if (code !== 'auth/popup-closed-by-user' && code !== 'auth/cancelled-popup-request') {
@@ -204,9 +481,8 @@ export const googleSignIn = async (
   }
 };
 
-export const getGmailAccessToken = (): string | null => cachedAccessToken;
-
 export const googleLogout = async (): Promise<void> => {
-  cachedAccessToken = null;
+  invalidateGmailAccessToken();
+  clearPersistedSession();
   await auth.signOut();
 };

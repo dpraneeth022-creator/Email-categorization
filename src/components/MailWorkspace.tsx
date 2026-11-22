@@ -33,16 +33,21 @@ interface MailWorkspaceProps {
   isClassifying: boolean;
   syncProgress: SyncProgressState;
   loadingFullMessageId: string | null;
+  reclassifyingMessageId: string | null;
+  needsGmailReconnect: boolean;
   statusMessage: string | null;
   errorMessage: string | null;
   onSyncInbox: () => void;
   onStopSync: () => void;
   onLoadOlderMail: () => void;
+  onReconnectGmail: () => void;
   onReauthorizeGmail?: () => void;
   onSignOut: () => void;
   onToggleReadState: (messageId: string, unread: boolean) => void;
   onDownloadAttachment: (message: MailMessage, attachment: MailAttachment) => Promise<void>;
   onEnsureFullMessage: (message: MailMessage) => void;
+  onManualReclassifyMessage: (message: MailMessage) => void;
+  onManualMoveMessage: (messageId: string, targetCategoryId: string) => void;
 }
 
 const ACCENT_DOT_CLASS: Record<RuleAccent, string> = {
@@ -87,16 +92,21 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   isClassifying,
   syncProgress,
   loadingFullMessageId,
+  reclassifyingMessageId,
+  needsGmailReconnect,
   statusMessage,
   errorMessage,
   onSyncInbox,
   onStopSync,
   onLoadOlderMail,
+  onReconnectGmail,
   onReauthorizeGmail,
   onSignOut,
   onToggleReadState,
   onDownloadAttachment,
   onEnsureFullMessage,
+  onManualReclassifyMessage,
+  onManualMoveMessage,
 }) => {
   const [activeFolder, setActiveFolder] = useState<string>('all');
   const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
@@ -473,6 +483,24 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
           </div>
         </header>
 
+        {/* Subtle non-blocking Gmail reconnect banner when 1-hour OAuth token expired */}
+        {needsGmailReconnect && !statusMessage && !errorMessage && (
+          <div
+            role="status"
+            className="px-4 lg:px-6 py-2 bg-slate-100 border-b border-slate-200 text-xs text-slate-700 flex flex-wrap items-center justify-between gap-3 shrink-0"
+          >
+            <span>Showing saved inbox — reconnect Gmail to sync new mail.</span>
+            <button
+              type="button"
+              onClick={onReconnectGmail}
+              disabled={isSyncBusy}
+              className="font-semibold text-blue-700 hover:text-blue-900 underline underline-offset-2 whitespace-nowrap cursor-pointer disabled:opacity-50"
+            >
+              Reconnect Gmail
+            </button>
+          </div>
+        )}
+
         {/* Friendly Rate-Limit / Sync Status Strip */}
         {statusMessage && (
           <div
@@ -716,16 +744,20 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
             {selectedMessage ? (
               <EmailReaderView
                 message={selectedMessage}
+                rules={rules}
                 currentIndex={selectedIndex}
                 totalCount={filteredMessages.length}
                 isExpanded={isDesktopExpanded}
                 isLoadingFullBody={loadingFullMessageId === selectedMessage.id}
+                isReclassifying={reclassifyingMessageId === selectedMessage.id}
                 onBackMobile={() => setIsMobileReaderOpen(false)}
                 onToggleExpand={() => setIsDesktopExpanded((prev) => !prev)}
                 onSelectPrevious={() => handleStepMessage(-1)}
                 onSelectNext={() => handleStepMessage(1)}
                 onToggleReadState={onToggleReadState}
                 onDownloadAttachment={onDownloadAttachment}
+                onManualReclassifyMessage={onManualReclassifyMessage}
+                onManualMoveMessage={onManualMoveMessage}
               />
             ) : (
               <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">

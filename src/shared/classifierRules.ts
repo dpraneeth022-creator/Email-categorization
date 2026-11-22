@@ -473,7 +473,7 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRule[] = [
     name: 'ACADEMIC MAILS',
     shortName: 'Academic',
     description:
-      'Strictly reserved for coursework, CIE/SEE exams, seating arrangements, syllabus, Google Classroom updates, MATLAB Grader, EL reviews, and official academic circulars.',
+      'Strictly reserved for coursework, Experiential Learning (EL, EL phase, EL evaluation, EL team, EL project, EL review), CIE/SEE exams, seating arrangements, syllabus, Google Classroom updates, MATLAB Grader, and official academic circulars.',
     accent: 'blue',
     senders: [
       'mail.grader.mathworks.com',
@@ -481,6 +481,12 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRule[] = [
       'no-reply@classroom.google.com',
     ],
     keywords: [
+      'experiential learning',
+      'el phase',
+      'el evaluation',
+      'el team',
+      'el project',
+      'el review',
       'cie',
       'see exam',
       'seating arrangement',
@@ -488,8 +494,6 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRule[] = [
       'google classroom',
       'matlab grader',
       'mathworks grader',
-      'el review',
-      'experiential learning',
       'coursework',
       'assignment',
       'timetable',
@@ -638,9 +642,16 @@ const PROMOTIONAL_SPAM_BRANDS_REGEX = /\b(lenovo|unlox|corizo)\b/i;
 const GOOGLE_SECURITY_ALERT_REGEX =
   /\b(security\s+alert|critical\s+security\s+alert|new\s+sign-?in|2-?step\s+verification|recovery\s+(?:email|phone)|app\s+password\s+created|google\s+account\s+security)\b/i;
 
-// Strict Academic signal: coursework, CIE/SEE exams, seating arrangements, syllabus, Google Classroom, MATLAB Grader, EL reviews, official academic circulars
+// Experiential Learning (EL) signal — strictly categorized under Academic (NEVER General)
+const EXPERIENTIAL_LEARNING_PHRASE_REGEX =
+  /\b(experiential[\s-]+learning|el[\s-]*(?:phase|phases|evaluation|evaluations|team|teams|project|projects|review|reviews|presentation|presentations|submission|submissions|rubric|rubrics|topic|topics|report|reports|group|groups|batch|batches|marks|guide|mentor|coordinator|viva|synopsis|demo|exhibition|schedule|timetable|registration|formation|allotment|panel|slot|slots|[1-4]|i{1,3}))\b/i;
+
+const EXPERIENTIAL_LEARNING_UPPER_EL_REGEX = /(?:^|[\s([\-:,/])(?:EL|E\.L\.?)(?=$|[\s)\]\-:.,/!?])/;
+const EXPERIENTIAL_LEARNING_SUBJECT_EL_REGEX = /\bel\b/i;
+
+// Strict Academic signal: coursework, Experiential Learning (EL), CIE/SEE exams, seating arrangements, syllabus, Google Classroom, MATLAB Grader, official academic circulars
 const STRICT_ACADEMIC_REGEX =
-  /\b(cie\b|cie-?\s*[123]|see\s+(?:exam|examination|timetable|schedule|result|results|seating)|seating\s+arrangement|exam\s+(?:seating|schedule|timetable|hall|centre|center|notification|circular|form|registration|result|results)|examination\s+(?:schedule|timetable|circular|notification|seating)|hall\s+ticket|revaluation|makeup\s+exam|make-?up\s+exam|supplementary\s+exam|syllabus|coursework|course\s+(?:registration|plan|material|outline|handout|drop|add)|google\s+classroom|new\s+(?:assignment|material|announcement)\s*:|matlab\s+grader|mathworks\s+grader|\bel\s+(?:review|reviews|phase|presentation|submission|evaluation|rubric|topic|report)\b|experiential\s+learning|project\s+(?:review|evaluation|submission|viva)|mini-?project\s+(?:review|viva)|lab\s+(?:manual|exam|test|internal|schedule|record|observation|viva)|internal\s+assessment|time\s*table|class\s+schedule|academic\s+(?:calendar|circular|schedule|council|regulation|notice|dean)|office\s+of\s+(?:dean\s+academics|controller\s+of\s+examinations|coe\b)|commencement\s+of\s+(?:classes|semester)|odd\s+semester|even\s+semester|attendance\s+(?:shortage|detention|list|update)|assignment\s+(?:due|submission|deadline|posted)|quiz\s+(?:schedule|link|marks)|marks\s+(?:sheet|list|published|uploaded)|grade\s+(?:card|sheet)|cgpa|sgpa|vtu\s+circular|working\s+saturday|class\s+(?:rescheduled|cancelled|postponed|timings)|lecture\s+(?:notes|slides)|semester\s+end\s+exam|backlog\s+exam)\b/i;
+  /\b(cie\b|cie-?\s*[123]|see\s+(?:exam|examination|timetable|schedule|result|results|seating)|seating\s+arrangement|exam\s+(?:seating|schedule|timetable|hall|centre|center|notification|circular|form|registration|result|results)|examination\s+(?:schedule|timetable|circular|notification|seating)|hall\s+ticket|revaluation|makeup\s+exam|make-?up\s+exam|supplementary\s+exam|syllabus|coursework|course\s+(?:registration|plan|material|outline|handout|drop|add)|google\s+classroom|new\s+(?:assignment|material|announcement)\s*:|matlab\s+grader|mathworks\s+grader|\bel\s+(?:review|reviews|phase|phases|evaluation|team|teams|project|projects|presentation|submission|rubric|topic|report)\b|experiential[\s-]+learning|project\s+(?:review|evaluation|submission|viva)|mini-?project\s+(?:review|viva)|lab\s+(?:manual|exam|test|internal|schedule|record|observation|viva)|internal\s+assessment|time\s*table|class\s+schedule|academic\s+(?:calendar|circular|schedule|council|regulation|notice|dean)|office\s+of\s+(?:dean\s+academics|controller\s+of\s+examinations|coe\b)|commencement\s+of\s+(?:classes|semester)|odd\s+semester|even\s+semester|attendance\s+(?:shortage|detention|list|update)|assignment\s+(?:due|submission|deadline|posted)|quiz\s+(?:schedule|link|marks)|marks\s+(?:sheet|list|published|uploaded)|grade\s+(?:card|sheet)|cgpa|sgpa|vtu\s+circular|working\s+saturday|class\s+(?:rescheduled|cancelled|postponed|timings)|lecture\s+(?:notes|slides)|semester\s+end\s+exam|backlog\s+exam)\b/i;
 
 export function hasStrongVolunteeringSignal(
   subject?: string,
@@ -742,6 +753,42 @@ export function hasSportsCulturalFestSignal(input: {
   return false;
 }
 
+export function hasExperientialLearningSignal(input: {
+  fromName?: string;
+  fromEmail?: string;
+  subject?: string;
+  snippet?: string;
+  bodyText?: string;
+}): boolean {
+  const cleanSubject = decodeHtmlEntities(input.subject || '');
+  const combined = decodeHtmlEntities(
+    `${input.fromName || ''} ${cleanSubject} ${input.snippet || ''} ${(
+      input.bodyText || ''
+    ).slice(0, 1500)}`
+  );
+
+  if (EXPERIENTIAL_LEARNING_PHRASE_REGEX.test(combined)) {
+    return true;
+  }
+
+  // Case-sensitive standalone "EL" / "E.L." anywhere in subject, snippet, or body
+  if (EXPERIENTIAL_LEARNING_UPPER_EL_REGEX.test(combined)) {
+    return true;
+  }
+
+  // Case-insensitive standalone "el" in subject or from RVCE institutional mail
+  const fromAddr = extractEmailAddress(input.fromEmail || '');
+  if (
+    EXPERIENTIAL_LEARNING_SUBJECT_EL_REGEX.test(cleanSubject) ||
+    (isOfficialInstitutionalOrGovEmail(fromAddr) &&
+      EXPERIENTIAL_LEARNING_SUBJECT_EL_REGEX.test(combined))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 export function hasStrictAcademicSignal(input: {
   fromName?: string;
   fromEmail?: string;
@@ -749,6 +796,10 @@ export function hasStrictAcademicSignal(input: {
   snippet?: string;
   bodyText?: string;
 }): boolean {
+  if (hasExperientialLearningSignal(input)) {
+    return true;
+  }
+
   const fromAddr = extractEmailAddress(input.fromEmail || '');
   const domain = getDomainFromAddress(fromAddr);
   // Inherently academic platforms
@@ -1065,6 +1116,15 @@ export function matchMessageDeterministically(
         matchedEntry: 'volunteering drive',
       };
     }
+  }
+
+  // 4.5. EXPERIENTIAL LEARNING (EL) -> Academic (strictly overrides General)
+  if (academicRule && hasExperientialLearningSignal(msg)) {
+    return {
+      categoryId: academicRule.id,
+      rule: academicRule,
+      matchedEntry: 'Experiential Learning (EL)',
+    };
   }
 
   // 5. SPORTS, CULTURAL & FEST MAILS -> General Inbox (NEVER Academic)

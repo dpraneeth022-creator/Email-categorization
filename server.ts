@@ -20,6 +20,7 @@ import {
   extractDisplayName,
   extractEmailAddress,
   hasClubSignal,
+  hasExperientialLearningSignal,
   hasSportsCulturalFestSignal,
   isOfficialPopularWebsiteEmail,
   matchMessageDeterministically,
@@ -477,7 +478,7 @@ STRICT PRIORITY RULES:
 3. VOLUNTEERING: NSS, NCC, blood donation, cleanliness/plantation drives, NGO/social outreach, community service, charity camps -> "volunteering".
 4. SPORTS, CULTURAL & FESTS -> "general" (NEVER "academic"): sports trials, physical education, runs, CARV/EVOKE auditions, music, dance, fashion, REACT, Synergy, Aeromania, Ignitron, departmental/college fests.
 5. PROMOTIONS & SPAM -> "spam": Promotional/marketing blasts (Lenovo, Unlox, Corizo), fake/paid internships, fake rewards/lotteries, unauthorized scholarships, phishing/scams, or Gmail-flagged SPAM.
-6. STRICT ACADEMIC -> "academic": Reserve ONLY for coursework, CIE/SEE exams, seating arrangements, syllabus, Google Classroom updates, MATLAB Grader, EL reviews, and official academic circulars. NEVER classify an email as "academic" just because it is from @rvce.edu.in.
+6. STRICT ACADEMIC -> "academic": Reserve ONLY for coursework, Experiential Learning (ANY email mentioning "Experiential Learning", "EL", "EL phase", "EL evaluation", "EL team", "EL project", or "EL review" MUST be strictly categorized under "academic", NEVER "general"), CIE/SEE exams, seating arrangements, syllabus, Google Classroom updates, MATLAB Grader, and official academic circulars. NEVER classify an email as "academic" just because it is from @rvce.edu.in.
 Match sender identity ONLY from the From: address (never To:).${feedbackContext}
 Return valid categoryId from ${JSON.stringify(validCategoryIds)}, confidence (0-1), and a crisp reason (<=12 words).`;
 
@@ -567,8 +568,17 @@ Return valid categoryId from ${JSON.stringify(validCategoryIds)}, confidence (0-
         safeCategory = 'clubs';
         reason = 'Routed exclusively to Clubs.';
       }
+      // Experiential Learning (EL) guardrail: strictly Academic, never General
+      if (
+        safeCategory === 'general' &&
+        allowedSet.has('academic') &&
+        hasExperientialLearningSignal(sourceEmail)
+      ) {
+        safeCategory = 'academic';
+        reason = 'Experiential Learning (EL) routed to Academic.';
+      }
       // Sports, cultural & fests override: always General Inbox, never Academic
-      if (safeCategory === 'academic' && hasSportsCulturalFestSignal(sourceEmail)) {
+      if (safeCategory === 'academic' && hasSportsCulturalFestSignal(sourceEmail) && !hasExperientialLearningSignal(sourceEmail)) {
         safeCategory = 'general';
         reason = 'Sports, cultural, or fest mail routed to General Inbox.';
       }
@@ -892,16 +902,28 @@ async function createServer() {
     }
   };
 
-  // Primary metadata-first incremental sync endpoint (supports large excludeIds arrays cleanly)
+  // Primary metadata-first incremental sync endpoint (supports afterTimestamp + large excludeIds arrays cleanly)
   app.post('/api/gmail/sync', async (req, res) => {
     const body = (req.body || {}) as {
       maxResults?: number;
       q?: string;
       pageToken?: string;
       excludeIds?: string[];
+      afterTimestamp?: number;
     };
     const maxResults = Math.min(100, Math.max(5, Number(body.maxResults) || 60));
-    const query = typeof body.q === 'string' ? body.q.trim() : '';
+    const rawQuery = typeof body.q === 'string' ? body.q.trim() : '';
+    const afterTs =
+      typeof body.afterTimestamp === 'number' &&
+      Number.isFinite(body.afterTimestamp) &&
+      body.afterTimestamp > 0
+        ? Math.floor(body.afterTimestamp)
+        : null;
+    const query = rawQuery
+      ? rawQuery
+      : afterTs
+      ? `-in:trash after:${afterTs}`
+      : '-in:trash';
     const pageToken = typeof body.pageToken === 'string' ? body.pageToken.trim() : '';
     const excludeIds = new Set<string>(
       Array.isArray(body.excludeIds)

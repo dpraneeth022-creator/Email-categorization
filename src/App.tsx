@@ -7,9 +7,16 @@ import {
   googleLogout,
   googleSignIn,
   initGoogleAuth,
+  invalidateGmailAccessToken,
+  isGmailTokenExpired,
+  loadPersistedSession,
+  savePersistedSession,
+  updatePersistedLastSync,
 } from './lib/firebaseAuth';
 import {
   loadCachedMailbox,
+  loadSavedClassifications,
+  saveCachedClassifications,
   saveCachedMessages,
   saveCachedMeta,
 } from './lib/mailCache';
@@ -24,6 +31,7 @@ import {
   canFastPathOfficialWebsiteToGeneral,
   classifyMessageLocallyFallback,
   decodeHtmlEntities,
+  hasExperientialLearningSignal,
   matchMessageDeterministically,
 } from './shared/classifierRules';
 import type {
@@ -65,7 +73,7 @@ function normalizeMessageText(msg: MailMessage): MailMessage {
 /**
  * Strictly deduplicates emails by message ID and thread ID so identical emails
  * never appear twice in a row. Preserves hydrated full HTML bodies/attachments
- * and keeps the newest message per thread sorted newest-first.
+ * and saved classifications, sorted newest-first.
  */
 function deduplicateAndSortMessages(list: MailMessage[]): MailMessage[] {
   const byId = new Map<string, MailMessage>();
@@ -83,12 +91,11 @@ function deduplicateAndSortMessages(list: MailMessage[]): MailMessage[] {
         bodyText: msg.fullBodyLoaded ? msg.bodyText : existing.bodyText || msg.bodyText,
         attachments: msg.attachments?.length ? msg.attachments : existing.attachments,
         fullBodyLoaded: Boolean(msg.fullBodyLoaded || existing.fullBodyLoaded),
-        classification: msg.classification || existing.classification,
+        classification: existing.classification || msg.classification,
       });
     }
   }
 
-  // Deduplicate by threadId so repeated thread messages do not appear twice in a row
   const byThread = new Map<string, MailMessage>();
   for (const msg of byId.values()) {
     const threadKey = msg.threadId ? `thread:${msg.threadId}` : `id:${msg.id}`;
@@ -106,6 +113,7 @@ function deduplicateAndSortMessages(list: MailMessage[]): MailMessage[] {
       bodyHtml: newer.bodyHtml || older.bodyHtml,
       attachments: newer.attachments?.length ? newer.attachments : older.attachments,
       fullBodyLoaded: Boolean(newer.fullBodyLoaded || older.fullBodyLoaded),
+      classification: newer.classification || older.classification,
     });
   }
 
@@ -114,6 +122,19 @@ function deduplicateAndSortMessages(list: MailMessage[]): MailMessage[] {
     const timeB = Date.parse(b.dateIso) || 0;
     return timeB - timeA;
   });
+}
+
+function getLatestMessageEpochSeconds(list: MailMessage[]): number | null {
+  let latestMs = 0;
+  for (const msg of list) {
+    const ms = Date.parse(msg.dateIso);
+    if (Number.isFinite(ms) && ms > latestMs) {
+      latestMs = ms;
+    }
+  }
+  if (latestMs <= 0) return null;
+  // Subtract 60s safety overlap (excludeIds guarantees cached IDs are skipped)
+  return Math.max(0, Math.floor(latestMs / 1000) - 60);
 }
 
 function triggerBlobDownload(blob: Blob, filename: string) {
@@ -128,7 +149,20 @@ function triggerBlobDownload(blob: Blob, filename: string) {
 }
 
 export default function App() {
-  const [account, setAccount] = useState<ConnectedAccount | null>(null);
+  // Synchronously restore "Keep me signed in" campus session so reopening Chrome opens immediately
+  const initialSessionRef = useRef(loadPersistedSession());
+
+  const [account, setAccount] = useState<ConnectedAccount | null>(
+    () => initialSessionRef.current?.account ?? null
+  );
+  const [keepSignedIn, setKeepSignedIn] = useState<boolean>(
+    () => initialSessionRef.current?.keepSignedIn ?? true
+  );
+  const [needsGmailReconnect, setNeedsGmailReconnect] = useState<boolean>(() => {
+    const sess = initialSessionRef.current;
+    return Boolean(sess && isGmailTokenExpired(sess.account.email));
+  });
+
   const [providerStatus, setProviderStatus] = useState<ProviderConfigStatus | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -143,6 +177,7 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [loadingFullMessageId, setLoadingFullMessageId] = useState<string | null>(null);
+  const [reclassifyingMessageId, setReclassifyingMessageId] = useState<string | null>(null);
 
   const [syncProgress, setSyncProgress] = useState<SyncProgressState>({
     isRunning: false,
@@ -156,10 +191,15 @@ export default function App() {
   const syncRunIdRef = useRef(0);
   const nextPageTokenRef = useRef<string | null>(null);
   const totalEstimateRef = useRef<number | null>(null);
+  const latestTimestampRef = useRef<number | null>(null);
+  const elMigratedRef = useRef<boolean>(false);
+  const hydratedAccountRef = useRef<string | null>(null);
   const fullBodyInFlightRef = useRef<Set<string>>(new Set());
 
   const accountRef = useRef<ConnectedAccount | null>(account);
   accountRef.current = account;
+  const keepSignedInRef = useRef(keepSignedIn);
+  keepSignedInRef.current = keepSignedIn;
   const rulesRef = useRef(rules);
   rulesRef.current = rules;
   const feedbackRef = useRef(feedbackExamples);
@@ -185,8 +225,9 @@ export default function App() {
   }, []);
 
   /**
-   * Classifies messages in 0ms deterministically + calls campus-authenticated Gemini batcher
-   * for ambiguous emails, then persists updated categories directly to IndexedDB.
+   * Classifies ONLY newly fetched / unclassified messages unless forceReclassify === true.
+   * Strictly checks IndexedDB before running local rules or Gemini API so already-classified
+   * messageIds are NEVER re-classified automatically.
    */
   const classifyMessages = useCallback(
     async (
@@ -197,15 +238,56 @@ export default function App() {
         runId?: number;
         accountEmail?: string;
         tokenOverride?: string;
+        forceReclassify?: boolean;
       }
     ): Promise<Record<string, MailClassification>> => {
       if (targetMessages.length === 0) return {};
+
+      const acctEmail = options?.accountEmail || accountRef.current?.email || '';
+      const forceReclassify = Boolean(options?.forceReclassify);
+
+      // Step 0: Strictly skip any messageId that already has a saved category in IndexedDB
+      let messagesToClassify: MailMessage[] = targetMessages;
+      const restoredFromIdb: Record<string, MailClassification> = {};
+
+      if (!forceReclassify) {
+        const savedMap = acctEmail ? await loadSavedClassifications(acctEmail) : {};
+        const pending: MailMessage[] = [];
+        for (const msg of targetMessages) {
+          const savedCls = savedMap[msg.id];
+          if (savedCls?.categoryId) {
+            if (!msg.classification?.categoryId) {
+              restoredFromIdb[msg.id] = savedCls;
+            }
+            continue;
+          }
+          if (msg.classification?.categoryId) {
+            continue;
+          }
+          pending.push(msg);
+        }
+        messagesToClassify = pending;
+
+        if (Object.keys(restoredFromIdb).length > 0) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              restoredFromIdb[m.id] && !m.classification?.categoryId
+                ? { ...m, classification: restoredFromIdb[m.id] }
+                : m
+            )
+          );
+        }
+      }
+
+      if (messagesToClassify.length === 0) {
+        return restoredFromIdb;
+      }
 
       const allResults: Record<string, MailClassification> = {};
       const unmatchedMessages: MailMessage[] = [];
 
       // Step 1: Instant 0ms strict deterministic + popular-website fast-path
-      for (const msg of targetMessages) {
+      for (const msg of messagesToClassify) {
         const directMatch = matchMessageDeterministically(msg, activeRules);
         if (directMatch) {
           allResults[msg.id] = {
@@ -234,7 +316,6 @@ export default function App() {
       ) => {
         if (Object.keys(partial).length === 0) return;
 
-        // Build persisted snapshot synchronously (never rely on React's deferred setState updater to populate an array)
         const baseById = new Map<string, MailMessage>();
         for (const msg of messagesRef.current) baseById.set(msg.id, msg);
         for (const msg of sourceList) {
@@ -256,20 +337,25 @@ export default function App() {
           })
         );
 
-        const acctEmail = options?.accountEmail || accountRef.current?.email;
-        if (acctEmail && updatedForCache.length > 0) {
-          void saveCachedMessages(acctEmail, updatedForCache);
+        if (acctEmail) {
+          if (updatedForCache.length > 0) {
+            void saveCachedMessages(acctEmail, updatedForCache);
+          } else {
+            void saveCachedClassifications(acctEmail, partial);
+          }
         }
       };
 
-      applyAndPersist(allResults, targetMessages);
+      applyAndPersist(allResults, messagesToClassify);
 
-      if (unmatchedMessages.length === 0) return allResults;
+      if (unmatchedMessages.length === 0) {
+        return { ...restoredFromIdb, ...allResults };
+      }
 
-      // Step 2: Send remaining ambiguous emails in chunks to server AI classifier (with zero-cost local fallback)
+      // Step 2: Classify remaining brand-new ambiguous emails via Gemini (with zero-cost local fallback)
       setIsClassifying(true);
       try {
-        const gmailToken = options?.tokenOverride || getGmailAccessToken();
+        const gmailToken = options?.tokenOverride || getGmailAccessToken(acctEmail);
         const chunkSize = 75;
 
         for (let i = 0; i < unmatchedMessages.length; i += chunkSize) {
@@ -308,6 +394,10 @@ export default function App() {
                   feedbackExamples: activeFeedback,
                 }),
               });
+              if (res.status === 401) {
+                invalidateGmailAccessToken();
+                setNeedsGmailReconnect(true);
+              }
               const data = await res.json();
               if (res.ok && data?.classifications) {
                 chunkMap = data.classifications as Record<string, MailClassification>;
@@ -334,14 +424,109 @@ export default function App() {
         setIsClassifying(false);
       }
 
-      return allResults;
+      return { ...restoredFromIdb, ...allResults };
     },
     []
   );
 
   /**
+   * Hydrates the entire inbox instantaneously from Chrome's IndexedDB and runs the
+   * one-time Experiential Learning migration (General -> Academic) without touching
+   * any other already-classified emails.
+   */
+  const hydrateMailboxFromIndexedDb = useCallback(
+    async (
+      connected: ConnectedAccount
+    ): Promise<{
+      messages: MailMessage[];
+      latestEpochSec: number | null;
+    }> => {
+      const { messages: cachedList, meta } = await loadCachedMailbox(connected.email);
+      let deduped = deduplicateAndSortMessages(cachedList);
+
+      if (meta?.nextPageToken) {
+        nextPageTokenRef.current = meta.nextPageToken;
+      }
+      if (meta?.totalEstimate) {
+        totalEstimateRef.current = meta.totalEstimate;
+      }
+
+      // One-time migration: move existing cached Experiential Learning emails from General -> Academic
+      if (!meta?.elToAcademicMigrated && deduped.length > 0) {
+        const migratedUpdates: MailMessage[] = [];
+        deduped = deduped.map((msg) => {
+          const currentCat = msg.classification?.categoryId || 'general';
+          if (currentCat === 'general' && hasExperientialLearningSignal(msg)) {
+            const updated: MailMessage = {
+              ...msg,
+              classification: {
+                categoryId: 'academic',
+                confidence: 1.0,
+                matchedBy: 'directory',
+                reason: 'Experiential Learning (EL) routed to Academic.',
+              },
+            };
+            migratedUpdates.push(updated);
+            return updated;
+          }
+          return msg;
+        });
+
+        if (migratedUpdates.length > 0) {
+          await saveCachedMessages(connected.email, migratedUpdates);
+        }
+
+        const latestSec = getLatestMessageEpochSeconds(deduped);
+        latestTimestampRef.current = latestSec;
+        elMigratedRef.current = true;
+
+        await saveCachedMeta({
+          accountEmail: connected.email,
+          nextPageToken: meta?.nextPageToken ?? nextPageTokenRef.current,
+          totalEstimate: meta?.totalEstimate ?? totalEstimateRef.current,
+          rulesVersion: meta?.rulesVersion || CURRENT_RULES_VERSION,
+          lastSyncedAt: meta?.lastSyncedAt || Date.now(),
+          latestMessageTimestamp: latestSec,
+          elToAcademicMigrated: true,
+        });
+      } else {
+        elMigratedRef.current = Boolean(meta?.elToAcademicMigrated);
+        latestTimestampRef.current =
+          getLatestMessageEpochSeconds(deduped) ?? meta?.latestMessageTimestamp ?? null;
+      }
+
+      hydratedAccountRef.current = connected.email.toLowerCase();
+      messagesRef.current = deduped;
+      setMessages(deduped);
+      setSyncProgress({
+        isRunning: false,
+        fetchedCount: deduped.length,
+        classifiedCount: deduped.filter((m) => Boolean(m.classification?.categoryId)).length,
+        totalEstimate: totalEstimateRef.current,
+        hasMore: Boolean(nextPageTokenRef.current),
+        phaseLabel: '',
+      });
+
+      // Classify ONLY emails that have never been classified before (strictly skips already-classified IDs)
+      const unclassified = deduped.filter((m) => !m.classification?.categoryId);
+      if (unclassified.length > 0) {
+        await classifyMessages(unclassified, rulesRef.current, feedbackRef.current, {
+          accountEmail: connected.email,
+          forceReclassify: false,
+        });
+      }
+
+      return {
+        messages: deduped,
+        latestEpochSec: latestTimestampRef.current,
+      };
+    },
+    [classifyMessages]
+  );
+
+  /**
    * Calls POST /api/gmail/sync with automatic exponential backoff (2s, 4s, 8s) on 403/429 rate limits,
-   * displaying a friendly status notice instead of raw Gmail API project numbers.
+   * and graceful 401 handling (sets reconnect banner without forcing sign-out).
    */
   const requestGmailSyncPageWithBackoff = useCallback(
     async (
@@ -350,6 +535,7 @@ export default function App() {
         maxResults: number;
         pageToken?: string;
         excludeIds: string[];
+        afterTimestamp?: number;
       },
       runId: number
     ): Promise<{
@@ -359,6 +545,7 @@ export default function App() {
       skippedCachedCount: number;
       allPageCached: boolean;
       rateLimited: boolean;
+      tokenExpired?: boolean;
     }> => {
       let attempt = 0;
 
@@ -382,6 +569,20 @@ export default function App() {
           },
           body: JSON.stringify(payload),
         });
+
+        if (res.status === 401) {
+          invalidateGmailAccessToken();
+          setNeedsGmailReconnect(true);
+          return {
+            messages: [],
+            nextPageToken: payload.pageToken || null,
+            resultSizeEstimate: 0,
+            skippedCachedCount: 0,
+            allPageCached: false,
+            rateLimited: false,
+            tokenExpired: true,
+          };
+        }
 
         const rawText = await res.text();
         let data: {
@@ -411,7 +612,6 @@ export default function App() {
             attempt += 1;
             continue;
           }
-          // Stop gracefully without showing raw errors; user can continue syncing shortly
           return {
             messages: Array.isArray(data.messages) ? data.messages : [],
             nextPageToken: payload.pageToken || null,
@@ -449,9 +649,10 @@ export default function App() {
 
   /**
    * Incremental Sync Inbox:
-   * 1. Immediately displays cached emails from IndexedDB (0ms load) and re-runs strict rules on cached emails.
-   * 2. Fetches ONLY uncached new emails from Gmail in metadata-first mode (skipping cached IDs).
-   * 3. Automatically classifies new emails and persists everything to IndexedDB.
+   * 1. Hydrates cached emails instantaneously from IndexedDB (and runs one-time EL migration).
+   * 2. Only fetches NEW emails arrived after the latest cached timestamp (plus excludeIds).
+   * 3. Classifies ONLY brand-new emails that do not yet exist in IndexedDB's classification store.
+   * 4. Never forces sign-out if the 1-hour Gmail token expired — refreshes token on user click or shows subtle banner.
    */
   const syncInbox = useCallback(
     async (
@@ -460,10 +661,12 @@ export default function App() {
         tokenOverride?: string;
         loadOlderOnly?: boolean;
         hydrateCacheFirst?: boolean;
+        interactiveAuth?: boolean;
       }
     ): Promise<boolean> => {
       const runId = ++syncRunIdRef.current;
       const isLoadOlder = Boolean(options?.loadOlderOnly);
+      const interactiveAuth = options?.interactiveAuth ?? true;
 
       if (isLoadOlder) {
         setIsLoadingOlder(true);
@@ -477,80 +680,53 @@ export default function App() {
       const activeFeedback = feedbackRef.current;
 
       try {
-        let currentMessages = messagesRef.current;
-        let cachedIds = new Set<string>(currentMessages.map((m) => m.id));
-
-        // Instant IndexedDB load + automatic strict re-classification of existing cached emails
-        if (options?.hydrateCacheFirst || (!isLoadOlder && currentMessages.length === 0)) {
-          const { messages: cachedList, meta } = await loadCachedMailbox(connected.email);
+        // Hydrate from IndexedDB first if not yet hydrated for this account
+        if (
+          options?.hydrateCacheFirst ||
+          hydratedAccountRef.current !== connected.email.toLowerCase()
+        ) {
+          await hydrateMailboxFromIndexedDb(connected);
           if (syncRunIdRef.current !== runId) return false;
-
-          if (cachedList.length > 0) {
-            const dedupedCached = deduplicateAndSortMessages(cachedList);
-            currentMessages = dedupedCached;
-            cachedIds = new Set(dedupedCached.map((m) => m.id));
-            setMessages(dedupedCached);
-
-            if (meta?.nextPageToken && !nextPageTokenRef.current) {
-              nextPageTokenRef.current = meta.nextPageToken;
-            }
-            if (meta?.totalEstimate && !totalEstimateRef.current) {
-              totalEstimateRef.current = meta.totalEstimate;
-            }
-
-            setSyncProgress({
-              isRunning: true,
-              fetchedCount: dedupedCached.length,
-              classifiedCount: dedupedCached.filter((m) => Boolean(m.classification)).length,
-              totalEstimate: totalEstimateRef.current,
-              hasMore: Boolean(nextPageTokenRef.current),
-              phaseLabel: 'Checking for new emails',
-            });
-
-            // Re-run updated strict categorization rules on all cached emails immediately
-            const needsRuleUpgrade = meta?.rulesVersion !== CURRENT_RULES_VERSION;
-            const emailsToReclassify = needsRuleUpgrade
-              ? dedupedCached
-              : dedupedCached.filter((m) => !m.classification);
-
-            if (emailsToReclassify.length > 0) {
-              await classifyMessages(emailsToReclassify, activeRules, activeFeedback, {
-                runId,
-                accountEmail: connected.email,
-                tokenOverride: options?.tokenOverride,
-              });
-              await saveCachedMeta({
-                accountEmail: connected.email,
-                nextPageToken: nextPageTokenRef.current,
-                totalEstimate: totalEstimateRef.current,
-                rulesVersion: CURRENT_RULES_VERSION,
-                lastSyncedAt: Date.now(),
-              });
-            }
-          }
         }
 
-        let accessToken = options?.tokenOverride || getGmailAccessToken();
+        let currentMessages = messagesRef.current;
+        const cachedIds = new Set<string>(currentMessages.map((m) => m.id));
+
+        let accessToken = options?.tokenOverride || getGmailAccessToken(connected.email);
         if (!accessToken) {
-          // User clicked Sync Inbox / Load Older Mail after a page reload from IndexedDB cache:
-          // refresh the in-memory Gmail OAuth token cleanly via Google popup
+          if (!interactiveAuth) {
+            // Background auto-sync on Chrome reopen with expired 1h token:
+            // keep cached inbox visible & show subtle reconnect banner without blocking UI
+            setNeedsGmailReconnect(true);
+            return false;
+          }
+
           try {
-            const refreshed = await googleSignIn(false, allowedDomainsRef.current);
-            accessToken = refreshed?.accessToken || getGmailAccessToken();
+            const refreshed = await googleSignIn(
+              false,
+              allowedDomainsRef.current,
+              keepSignedInRef.current,
+              connected.email
+            );
+            accessToken = refreshed?.accessToken || getGmailAccessToken(connected.email);
           } catch (authErr) {
+            setNeedsGmailReconnect(true);
             throw new Error(
               authErr instanceof Error
                 ? authErr.message
-                : 'Sign in with your RVCE Google account to sync new emails.'
+                : 'Reconnect Gmail to sync new emails.'
             );
           }
         }
+
         if (!accessToken) {
-          throw new Error('Your Gmail session expired. Click Re-authorize Gmail to reconnect.');
+          setNeedsGmailReconnect(true);
+          return false;
         }
 
+        setNeedsGmailReconnect(false);
+
         if (isLoadOlder) {
-          // Fetch the next older page using saved pagination token
           const pageToken = nextPageTokenRef.current;
           if (!pageToken) {
             setSyncProgress((prev) => ({ ...prev, hasMore: false, isRunning: false }));
@@ -568,6 +744,7 @@ export default function App() {
           );
 
           if (syncRunIdRef.current !== runId) return false;
+          if (page.tokenExpired) return false;
 
           nextPageTokenRef.current = page.nextPageToken;
           if (page.resultSizeEstimate > 0) {
@@ -580,27 +757,36 @@ export default function App() {
           const freshMessages = page.messages.filter((m) => !cachedIds.has(m.id));
           if (freshMessages.length > 0) {
             const merged = deduplicateAndSortMessages([...messagesRef.current, ...freshMessages]);
+            messagesRef.current = merged;
             setMessages(merged);
             await saveCachedMessages(connected.email, freshMessages);
             await classifyMessages(freshMessages, activeRules, activeFeedback, {
               runId,
               accountEmail: connected.email,
               tokenOverride: accessToken,
+              forceReclassify: false,
             });
           }
 
+          const now = Date.now();
+          latestTimestampRef.current =
+            getLatestMessageEpochSeconds(messagesRef.current) ?? latestTimestampRef.current;
           await saveCachedMeta({
             accountEmail: connected.email,
             nextPageToken: nextPageTokenRef.current,
             totalEstimate: totalEstimateRef.current,
             rulesVersion: CURRENT_RULES_VERSION,
-            lastSyncedAt: Date.now(),
+            lastSyncedAt: now,
+            latestMessageTimestamp: latestTimestampRef.current,
+            elToAcademicMigrated: true,
           });
+          updatePersistedLastSync(now);
 
           setSyncProgress({
             isRunning: false,
             fetchedCount: messagesRef.current.length,
-            classifiedCount: messagesRef.current.filter((m) => Boolean(m.classification)).length,
+            classifiedCount: messagesRef.current.filter((m) => Boolean(m.classification?.categoryId))
+              .length,
             totalEstimate: totalEstimateRef.current,
             hasMore: Boolean(nextPageTokenRef.current),
             phaseLabel: '',
@@ -609,8 +795,12 @@ export default function App() {
           return true;
         }
 
-        // Incremental Sync Inbox: walk from newest page until we hit already-cached pages (or 2 initial pages on first-ever load)
+        // Incremental Sync Inbox:
+        // If we already have cached emails, query Gmail ONLY for emails after the latest cached timestamp!
         const isInitialEmptySync = cachedIds.size === 0;
+        const afterTimestamp = isInitialEmptySync
+          ? undefined
+          : getLatestMessageEpochSeconds(currentMessages) ?? latestTimestampRef.current ?? undefined;
         const maxIncrementalPages = isInitialEmptySync ? 2 : 4;
         let pageToken: string | undefined = undefined;
         let pagesFetched = 0;
@@ -628,23 +818,25 @@ export default function App() {
               maxResults: 60,
               pageToken,
               excludeIds: Array.from(cachedIds),
+              afterTimestamp,
             },
             runId
           );
 
           if (syncRunIdRef.current !== runId) return false;
+          if (page.tokenExpired) return false;
 
           pagesFetched += 1;
 
-          if (page.resultSizeEstimate > 0) {
+          if (page.resultSizeEstimate > 0 && isInitialEmptySync) {
             totalEstimateRef.current = Math.max(
               totalEstimateRef.current || 0,
               page.resultSizeEstimate
             );
           }
 
-          // Preserve oldest pagination cursor so "Load Older Mail" continues seamlessly from where cache ends
-          if (isInitialEmptySync || !nextPageTokenRef.current) {
+          // Preserve oldest pagination cursor ONLY during initial full-inbox walk (never overwrite with filtered after: query cursor)
+          if (isInitialEmptySync) {
             nextPageTokenRef.current = page.nextPageToken;
           }
 
@@ -653,12 +845,16 @@ export default function App() {
 
           if (freshMessages.length > 0) {
             const merged = deduplicateAndSortMessages([...freshMessages, ...messagesRef.current]);
+            messagesRef.current = merged;
+            currentMessages = merged;
             setMessages(merged);
             await saveCachedMessages(connected.email, freshMessages);
+            // Strictly classify ONLY newly fetched emails
             await classifyMessages(freshMessages, activeRules, activeFeedback, {
               runId,
               accountEmail: connected.email,
               tokenOverride: accessToken,
+              forceReclassify: false,
             });
           }
 
@@ -666,41 +862,40 @@ export default function App() {
             break;
           }
 
-          // Stop incremental sync as soon as we reach already-cached mail
           if (page.allPageCached || (!isInitialEmptySync && page.skippedCachedCount > 0)) {
             break;
           }
 
           if (!page.nextPageToken) {
-            nextPageTokenRef.current = null;
+            if (isInitialEmptySync) {
+              nextPageTokenRef.current = null;
+            }
             break;
           }
 
           pageToken = page.nextPageToken;
         }
 
-        // Also ensure every currently loaded email obeys the latest strict rules
-        const latestMsgs = messagesRef.current;
-        if (latestMsgs.length > 0 && syncRunIdRef.current === runId) {
-          await classifyMessages(latestMsgs, activeRules, activeFeedback, {
-            runId,
-            accountEmail: connected.email,
-            tokenOverride: accessToken,
-          });
-        }
+        const now = Date.now();
+        latestTimestampRef.current =
+          getLatestMessageEpochSeconds(messagesRef.current) ?? latestTimestampRef.current;
 
         await saveCachedMeta({
           accountEmail: connected.email,
           nextPageToken: nextPageTokenRef.current,
           totalEstimate: totalEstimateRef.current,
           rulesVersion: CURRENT_RULES_VERSION,
-          lastSyncedAt: Date.now(),
+          lastSyncedAt: now,
+          latestMessageTimestamp: latestTimestampRef.current,
+          elToAcademicMigrated: true,
         });
+        updatePersistedLastSync(now);
 
         setSyncProgress({
           isRunning: false,
           fetchedCount: messagesRef.current.length,
-          classifiedCount: messagesRef.current.filter((m) => Boolean(m.classification)).length,
+          classifiedCount: messagesRef.current.filter((m) => Boolean(m.classification?.categoryId))
+            .length,
           totalEstimate: totalEstimateRef.current,
           hasMore: Boolean(nextPageTokenRef.current),
           phaseLabel: '',
@@ -724,7 +919,7 @@ export default function App() {
         }
       }
     },
-    [classifyMessages, requestGmailSyncPageWithBackoff]
+    [classifyMessages, hydrateMailboxFromIndexedDb, requestGmailSyncPageWithBackoff]
   );
 
   const handleStopSync = useCallback(() => {
@@ -742,74 +937,146 @@ export default function App() {
   }, []);
 
   /**
-   * On-demand full email body loader: fetches format=full ONLY when the user clicks an email,
-   * re-runs strict classification if body reveals a Club/Survey/Volunteering/Academic signal,
-   * and saves the full HTML body + attachments to IndexedDB so future opens are instant.
+   * On-demand full email body loader: fetches format=full ONLY when clicked,
+   * saves the full HTML body + attachments to IndexedDB, and NEVER overwrites an already-saved category.
    */
-  const handleEnsureFullMessage = useCallback(async (message: MailMessage) => {
-    if (message.provider !== 'gmail' || message.fullBodyLoaded !== false) return;
-    if (fullBodyInFlightRef.current.has(message.id)) return;
-
-    const token = getGmailAccessToken();
-    if (!token) {
-      setStatusMessage('Showing cached inbox — click Sync Inbox to load full email content and new mail.');
-      return;
-    }
-
-    fullBodyInFlightRef.current.add(message.id);
-    setLoadingFullMessageId(message.id);
-
-    try {
-      const res = await fetch(`/api/gmail/messages/${encodeURIComponent(message.id)}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) return;
-      const data = (await res.json()) as {
-        id: string;
-        bodyText?: string;
-        bodyHtml?: string;
-        attachments?: MailAttachment[];
-        fullBodyLoaded?: boolean;
-      };
-
-      const latestBase = messagesRef.current.find((m) => m.id === message.id) || message;
-      const hydrated: MailMessage = {
-        ...latestBase,
-        bodyText: data.bodyText ?? latestBase.bodyText,
-        bodyHtml: data.bodyHtml,
-        attachments: data.attachments,
-        fullBodyLoaded: true,
-      };
-
-      // Re-evaluate strict single-category rules now that the full body text is available
-      const directMatch = matchMessageDeterministically(hydrated, rulesRef.current);
-      if (directMatch) {
-        hydrated.classification = {
-          categoryId: directMatch.categoryId,
-          confidence: 1.0,
-          matchedBy: 'directory',
-          reason: directMatch.rule
-            ? `Matched ${directMatch.rule.shortName} (${directMatch.matchedEntry}).`
-            : `Routed to General Inbox (${directMatch.matchedEntry}).`,
-        };
-      }
-
-      setMessages((prev) => prev.map((m) => (m.id === message.id ? hydrated : m)));
+  const handleEnsureFullMessage = useCallback(
+    async (message: MailMessage) => {
+      if (message.provider !== 'gmail' || message.fullBodyLoaded !== false) return;
+      if (fullBodyInFlightRef.current.has(message.id)) return;
 
       const acctEmail = accountRef.current?.email;
-      if (acctEmail) {
-        await saveCachedMessages(acctEmail, [hydrated]);
+      const token = getGmailAccessToken(acctEmail);
+      if (!token) {
+        setNeedsGmailReconnect(true);
+        return;
       }
-    } catch {
-      // Keep snippet fallback cleanly if full hydration fails transiently
-    } finally {
-      fullBodyInFlightRef.current.delete(message.id);
-      setLoadingFullMessageId((curr) => (curr === message.id ? null : curr));
+
+      fullBodyInFlightRef.current.add(message.id);
+      setLoadingFullMessageId(message.id);
+
+      try {
+        const res = await fetch(`/api/gmail/messages/${encodeURIComponent(message.id)}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (res.status === 401) {
+          invalidateGmailAccessToken();
+          setNeedsGmailReconnect(true);
+          return;
+        }
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          id: string;
+          bodyText?: string;
+          bodyHtml?: string;
+          attachments?: MailAttachment[];
+          fullBodyLoaded?: boolean;
+        };
+
+        const latestBase = messagesRef.current.find((m) => m.id === message.id) || message;
+        const hydrated: MailMessage = {
+          ...latestBase,
+          bodyText: data.bodyText ?? latestBase.bodyText,
+          bodyHtml: data.bodyHtml,
+          attachments: data.attachments,
+          fullBodyLoaded: true,
+        };
+
+        setMessages((prev) => prev.map((m) => (m.id === message.id ? hydrated : m)));
+
+        if (acctEmail) {
+          await saveCachedMessages(acctEmail, [hydrated]);
+          // Only classify if this messageId does NOT yet have a saved category in IndexedDB
+          if (!hydrated.classification?.categoryId) {
+            await classifyMessages([hydrated], rulesRef.current, feedbackRef.current, {
+              accountEmail: acctEmail,
+              forceReclassify: false,
+            });
+          }
+        }
+      } catch {
+        // Keep snippet fallback cleanly if full hydration fails transiently
+      } finally {
+        fullBodyInFlightRef.current.delete(message.id);
+        setLoadingFullMessageId((curr) => (curr === message.id ? null : curr));
+      }
+    },
+    [classifyMessages]
+  );
+
+  /**
+   * Manual single-email Re-classify action (ONLY runs when user explicitly clicks "Re-classify").
+   */
+  const handleManualReclassifyMessage = useCallback(
+    async (message: MailMessage) => {
+      const acctEmail = accountRef.current?.email;
+      if (!acctEmail) return;
+      setReclassifyingMessageId(message.id);
+      try {
+        await classifyMessages([message], rulesRef.current, feedbackRef.current, {
+          accountEmail: acctEmail,
+          forceReclassify: true,
+        });
+      } finally {
+        setReclassifyingMessageId((curr) => (curr === message.id ? null : curr));
+      }
+    },
+    [classifyMessages]
+  );
+
+  /**
+   * Manual single-email category move (persists immediately to IndexedDB messages + classifications stores).
+   */
+  const handleManualMoveMessage = useCallback((messageId: string, targetCategoryId: string) => {
+    const manualClassification: MailClassification = {
+      categoryId: targetCategoryId,
+      confidence: 1.0,
+      matchedBy: 'user_feedback',
+      reason: 'Moved manually.',
+    };
+
+    const existing = messagesRef.current.find((m) => m.id === messageId);
+    const updatedMsg = existing ? { ...existing, classification: manualClassification } : null;
+
+    setMessages((prev) =>
+      prev.map((m) => (m.id === messageId ? { ...m, classification: manualClassification } : m))
+    );
+
+    const acctEmail = accountRef.current?.email;
+    if (acctEmail) {
+      if (updatedMsg) {
+        void saveCachedMessages(acctEmail, [updatedMsg]);
+      } else {
+        void saveCachedClassifications(acctEmail, { [messageId]: manualClassification });
+      }
     }
   }, []);
 
   const syncRef = useRef(syncInbox);
   syncRef.current = syncInbox;
+  const hydrateRef = useRef(hydrateMailboxFromIndexedDb);
+  hydrateRef.current = hydrateMailboxFromIndexedDb;
+
+  // On initial mount: immediately hydrate IndexedDB cache for persisted session (0ms instant inbox)
+  useEffect(() => {
+    const persisted = initialSessionRef.current;
+    if (!persisted?.account) return;
+
+    void hydrateRef.current(persisted.account).then(() => {
+      const validToken = getGmailAccessToken(persisted.account.email);
+      if (validToken) {
+        // Non-blocking background check for ONLY new emails arrived since latest cached timestamp
+        void syncRef.current(persisted.account, {
+          tokenOverride: validToken,
+          hydrateCacheFirst: false,
+          interactiveAuth: false,
+        });
+      } else {
+        // Token expired after 1 hour: keep cached inbox open and show subtle reconnect banner
+        setNeedsGmailReconnect(true);
+      }
+    });
+  }, []);
 
   // Initialize Firebase Google Auth listener ONCE on mount
   useEffect(() => {
@@ -833,66 +1100,46 @@ export default function App() {
           }
           return nextAccount;
         });
+        setNeedsGmailReconnect(false);
         setAuthError(null);
-        void syncRef.current(nextAccount, {
-          tokenOverride: token,
-          hydrateCacheFirst: true,
-        });
+        // Only trigger sync if not already hydrated and synced on mount
+        if (hydratedAccountRef.current !== nextAccount.email.toLowerCase()) {
+          void syncRef.current(nextAccount, {
+            tokenOverride: token,
+            hydrateCacheFirst: true,
+            interactiveAuth: false,
+          });
+        }
       },
       () => {
-        setAccount((prev) => (prev?.provider === 'gmail' ? null : prev));
+        // Only clear account if there is no persisted "Keep me signed in" session
+        const persisted = loadPersistedSession(allowedDomainsRef.current);
+        if (!persisted) {
+          setAccount((prev) => (prev?.provider === 'gmail' ? null : prev));
+        }
       },
       allowedDomainsRef.current,
       (restoredUser) => {
-        // Instant page-load opening from IndexedDB for an already signed-in campus user
+        // Firebase restored a signed-in campus user whose 1h Gmail token expired:
+        // open their cached IndexedDB inbox immediately and show subtle reconnect banner
         const email = restoredUser.email || '';
         if (!email || !isAllowedCampusEmail(email, allowedDomainsRef.current)) {
           setAccount(null);
           return;
         }
-        void loadCachedMailbox(email).then(async ({ messages: cachedList, meta }) => {
-          if (cachedList.length === 0) {
-            // No cached mail yet — keep user on AuthLanding to authorize Gmail once
-            setAccount(null);
-            return;
-          }
-
-          const restoredAccount: ConnectedAccount = {
-            provider: 'gmail',
-            email,
-            displayName: restoredUser.displayName || email,
-            photoUrl: restoredUser.photoURL || undefined,
-          };
-          const deduped = deduplicateAndSortMessages(cachedList);
-          messagesRef.current = deduped;
-          if (meta?.nextPageToken) nextPageTokenRef.current = meta.nextPageToken;
-          if (meta?.totalEstimate) totalEstimateRef.current = meta.totalEstimate;
-
-          setAccount(restoredAccount);
-          setMessages(deduped);
-          setSyncProgress({
-            isRunning: false,
-            fetchedCount: deduped.length,
-            classifiedCount: deduped.filter((m) => Boolean(m.classification)).length,
-            totalEstimate: meta?.totalEstimate ?? null,
-            hasMore: Boolean(meta?.nextPageToken),
-            phaseLabel: '',
-          });
-
-          // Immediately re-run updated strict rules on cached emails if rules upgraded
-          if (meta?.rulesVersion !== CURRENT_RULES_VERSION) {
-            await classifyMessages(deduped, rulesRef.current, feedbackRef.current, {
-              accountEmail: email,
-            });
-            await saveCachedMeta({
-              accountEmail: email,
-              nextPageToken: meta?.nextPageToken ?? null,
-              totalEstimate: meta?.totalEstimate ?? null,
-              rulesVersion: CURRENT_RULES_VERSION,
-              lastSyncedAt: meta?.lastSyncedAt ?? Date.now(),
-            });
-          }
-        });
+        const restoredAccount: ConnectedAccount = {
+          provider: 'gmail',
+          email,
+          displayName: restoredUser.displayName || email,
+          photoUrl: restoredUser.photoURL || undefined,
+        };
+        setAccount((prev) =>
+          prev?.email === restoredAccount.email ? prev : restoredAccount
+        );
+        setNeedsGmailReconnect(true);
+        if (hydratedAccountRef.current !== email.toLowerCase()) {
+          void hydrateRef.current(restoredAccount);
+        }
       }
     );
 
@@ -905,11 +1152,14 @@ export default function App() {
           displayName: result.user.displayName || result.user.email || 'Campus User',
           photoUrl: result.user.photoURL || undefined,
         };
+        savePersistedSession(connected, keepSignedInRef.current);
         setAccount(connected);
+        setNeedsGmailReconnect(false);
         setAuthError(null);
         void syncRef.current(connected, {
           tokenOverride: result.accessToken,
           hydrateCacheFirst: true,
+          interactiveAuth: false,
         });
       })
       .catch((err) => {
@@ -921,12 +1171,18 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  const handleGoogleLogin = async (forceConsent = false) => {
+  const handleGoogleLogin = async (forceConsent = false, keepSignedInChoice = true) => {
+    setKeepSignedIn(keepSignedInChoice);
     setIsLoggingIn(true);
     setAuthError(null);
     setWorkspaceError(null);
     try {
-      const result = await googleSignIn(forceConsent, allowedDomainsRef.current);
+      const result = await googleSignIn(
+        forceConsent,
+        allowedDomainsRef.current,
+        keepSignedInChoice,
+        accountRef.current?.email
+      );
       if (!result) return;
 
       const connected: ConnectedAccount = {
@@ -936,27 +1192,45 @@ export default function App() {
         photoUrl: result.user.photoURL || undefined,
       };
       setAccount(connected);
+      setNeedsGmailReconnect(false);
       await syncInbox(connected, {
         tokenOverride: result.accessToken,
         hydrateCacheFirst: true,
+        interactiveAuth: true,
       });
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'College Google sign-in was cancelled or failed.';
-      setAuthError(message);
+      if (accountRef.current) {
+        setWorkspaceError(message);
+      } else {
+        setAuthError(message);
+      }
     } finally {
       setIsLoggingIn(false);
     }
+  };
+
+  const handleReconnectGmail = async () => {
+    const active = accountRef.current;
+    if (!active) return;
+    await syncInbox(active, {
+      hydrateCacheFirst: false,
+      interactiveAuth: true,
+    });
   };
 
   const handleSignOut = async () => {
     syncRunIdRef.current += 1;
     nextPageTokenRef.current = null;
     totalEstimateRef.current = null;
+    latestTimestampRef.current = null;
+    hydratedAccountRef.current = null;
     if (account?.provider === 'gmail') {
       await googleLogout();
     }
     setAccount(null);
+    setNeedsGmailReconnect(false);
     setMessages([]);
     setWorkspaceError(null);
     setStatusMessage(null);
@@ -973,9 +1247,7 @@ export default function App() {
   const handleToggleReadState = useCallback((messageId: string, unread: boolean) => {
     const existing = messagesRef.current.find((m) => m.id === messageId);
     const updatedMsg = existing ? { ...existing, unread } : null;
-    setMessages((prev) =>
-      prev.map((m) => (m.id === messageId ? { ...m, unread } : m))
-    );
+    setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, unread } : m)));
     const acctEmail = accountRef.current?.email;
     if (acctEmail && updatedMsg) {
       void saveCachedMessages(acctEmail, [updatedMsg]);
@@ -998,9 +1270,21 @@ export default function App() {
       }
 
       if (message.provider === 'gmail') {
-        const token = getGmailAccessToken();
+        const acctEmail = accountRef.current?.email;
+        let token = getGmailAccessToken(acctEmail);
         if (!token) {
-          throw new Error('Your Gmail session expired. Click Re-authorize Gmail to download attachments.');
+          const refreshed = await googleSignIn(
+            false,
+            allowedDomainsRef.current,
+            keepSignedInRef.current,
+            acctEmail
+          );
+          token = refreshed?.accessToken || getGmailAccessToken(acctEmail);
+          if (token) setNeedsGmailReconnect(false);
+        }
+        if (!token) {
+          setNeedsGmailReconnect(true);
+          throw new Error('Reconnect Gmail to download this attachment.');
         }
 
         const params = new URLSearchParams({
@@ -1016,6 +1300,12 @@ export default function App() {
             headers: { Authorization: `Bearer ${token}` },
           }
         );
+
+        if (res.status === 401) {
+          invalidateGmailAccessToken();
+          setNeedsGmailReconnect(true);
+          throw new Error('Gmail token expired — click Reconnect Gmail to download.');
+        }
 
         if (!res.ok) {
           let errMsg = 'Failed to download attachment.';
@@ -1058,16 +1348,21 @@ export default function App() {
       isClassifying={isClassifying}
       syncProgress={syncProgress}
       loadingFullMessageId={loadingFullMessageId}
+      reclassifyingMessageId={reclassifyingMessageId}
+      needsGmailReconnect={needsGmailReconnect}
       statusMessage={statusMessage}
       errorMessage={workspaceError}
-      onSyncInbox={() => syncInbox(account)}
+      onSyncInbox={() => syncInbox(account, { interactiveAuth: true })}
       onStopSync={handleStopSync}
-      onLoadOlderMail={() => syncInbox(account, { loadOlderOnly: true })}
-      onReauthorizeGmail={() => handleGoogleLogin(true)}
+      onLoadOlderMail={() => syncInbox(account, { loadOlderOnly: true, interactiveAuth: true })}
+      onReconnectGmail={handleReconnectGmail}
+      onReauthorizeGmail={() => handleGoogleLogin(true, keepSignedIn)}
       onSignOut={handleSignOut}
       onToggleReadState={handleToggleReadState}
       onDownloadAttachment={handleDownloadAttachment}
       onEnsureFullMessage={handleEnsureFullMessage}
+      onManualReclassifyMessage={handleManualReclassifyMessage}
+      onManualMoveMessage={handleManualMoveMessage}
     />
   );
 }
