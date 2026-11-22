@@ -342,3 +342,45 @@ export async function saveCachedMeta(meta: CachedMailboxMeta): Promise<void> {
     }
   });
 }
+
+/**
+ * Permanently removes specified message IDs from both the messages and classifications IndexedDB stores.
+ */
+export async function deleteCachedMessages(
+  accountEmail: string,
+  messageIds: string[]
+): Promise<void> {
+  if (!accountEmail || messageIds.length === 0) return;
+  const db = await openCacheDb();
+  if (!db) return;
+
+  const acct = normalizeAccountKey(accountEmail);
+
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction([STORE_MESSAGES, STORE_CLASSIFICATIONS], 'readwrite');
+      const msgStore = tx.objectStore(STORE_MESSAGES);
+      const clsStore = tx.objectStore(STORE_CLASSIFICATIONS);
+
+      for (const id of messageIds) {
+        if (!id) continue;
+        const cacheKey = `${acct}::${id}`;
+        msgStore.delete(cacheKey);
+        clsStore.delete(cacheKey);
+      }
+
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+    } catch {
+      db.close();
+      resolve();
+    }
+  });
+}
+

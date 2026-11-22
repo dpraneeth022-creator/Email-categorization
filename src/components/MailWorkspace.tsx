@@ -7,9 +7,11 @@ import {
   Mail,
   Menu,
   Paperclip,
+  PenSquare,
   RefreshCw,
   Search,
   Share2,
+  Trash2,
   X,
 } from 'lucide-react';
 import type { SyncProgressState } from '../App';
@@ -21,6 +23,7 @@ import type {
   MailMessage,
   RuleAccent,
 } from '../shared/types';
+import { ComposeModal, type ComposeDraftPayload } from './ComposeModal';
 import { EmailReaderView } from './EmailReaderView';
 import { GoogleGIcon, OutlookIcon, YahooIcon } from './ProviderIcons';
 
@@ -34,20 +37,34 @@ interface MailWorkspaceProps {
   syncProgress: SyncProgressState;
   loadingFullMessageId: string | null;
   reclassifyingMessageId: string | null;
+  busyActionMessageId: string | null;
+  isEmptyingTrash: boolean;
   needsGmailReconnect: boolean;
+  needsMailActionScopeReauth: boolean;
   statusMessage: string | null;
   errorMessage: string | null;
+  toastMessage: string | null;
+  onDismissToast: () => void;
   onSyncInbox: () => void;
   onStopSync: () => void;
   onLoadOlderMail: () => void;
   onReconnectGmail: () => void;
-  onReauthorizeGmail?: () => void;
+  onReauthorizeGmail: () => Promise<boolean>;
   onSignOut: () => void;
   onToggleReadState: (messageId: string, unread: boolean) => void;
   onDownloadAttachment: (message: MailMessage, attachment: MailAttachment) => Promise<void>;
   onEnsureFullMessage: (message: MailMessage) => void;
   onManualReclassifyMessage: (message: MailMessage) => void;
   onManualMoveMessage: (messageId: string, targetCategoryId: string) => void;
+  onSendEmail: (draft: ComposeDraftPayload) => Promise<{
+    ok: boolean;
+    error?: string;
+    needsReauth?: boolean;
+  }>;
+  onTrashMessage: (message: MailMessage) => Promise<void>;
+  onRestoreMessage: (message: MailMessage) => Promise<void>;
+  onDeleteForeverMessage: (message: MailMessage) => Promise<void>;
+  onEmptyTrash: () => Promise<void>;
 }
 
 const ACCENT_DOT_CLASS: Record<RuleAccent, string> = {
@@ -67,6 +84,10 @@ const ACCENT_TEXT_CLASS: Record<RuleAccent, string> = {
   teal: 'text-teal-700',
   rose: 'text-rose-700',
 };
+
+function isMessageTrashed(msg: MailMessage): boolean {
+  return Boolean(msg.labelIds?.includes('TRASH'));
+}
 
 function formatShortDate(iso: string): string {
   const date = new Date(iso);
@@ -93,9 +114,14 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   syncProgress,
   loadingFullMessageId,
   reclassifyingMessageId,
+  busyActionMessageId,
+  isEmptyingTrash,
   needsGmailReconnect,
+  needsMailActionScopeReauth,
   statusMessage,
   errorMessage,
+  toastMessage,
+  onDismissToast,
   onSyncInbox,
   onStopSync,
   onLoadOlderMail,
@@ -107,6 +133,11 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   onEnsureFullMessage,
   onManualReclassifyMessage,
   onManualMoveMessage,
+  onSendEmail,
+  onTrashMessage,
+  onRestoreMessage,
+  onDeleteForeverMessage,
+  onEmptyTrash,
 }) => {
   const [activeFolder, setActiveFolder] = useState<string>('all');
   const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
@@ -117,6 +148,13 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [visibleListCount, setVisibleListCount] = useState(100);
   const [copiedCampusLink, setCopiedCampusLink] = useState(false);
+
+  const [isComposeOpen, setIsComposeOpen] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<
+    | { type: 'delete_forever'; message: MailMessage }
+    | { type: 'empty_trash'; count: number }
+    | null
+  >(null);
 
   const PUBLIC_CAMPUS_URL = 'https://email-categorization-tbkl.onrender.com';
   const isInternalPreviewContainer =
@@ -138,13 +176,19 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
 
   const folderCounts = useMemo(() => {
     const counts: Record<string, number> = {
-      all: messages.length,
+      all: 0,
       general: 0,
+      trash: 0,
     };
     for (const rule of rules) {
       counts[rule.id] = 0;
     }
     for (const msg of messages) {
+      if (isMessageTrashed(msg)) {
+        counts.trash += 1;
+        continue;
+      }
+      counts.all += 1;
       const cat = msg.classification?.categoryId || 'general';
       counts[cat] = (counts[cat] || 0) + 1;
     }
@@ -154,8 +198,15 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   const filteredMessages = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return messages.filter((msg) => {
-      const cat = msg.classification?.categoryId || 'general';
-      if (activeFolder !== 'all' && cat !== activeFolder) return false;
+      const trashed = isMessageTrashed(msg);
+      if (activeFolder === 'trash') {
+        if (!trashed) return false;
+      } else {
+        if (trashed) return false;
+        const cat = msg.classification?.categoryId || 'general';
+        if (activeFolder !== 'all' && cat !== activeFolder) return false;
+      }
+
       if (unreadOnly && !msg.unread) return false;
       if (q) {
         const haystack =
@@ -183,6 +234,7 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   const activeFolderLabel = useMemo(() => {
     if (activeFolder === 'all') return 'All Mail';
     if (activeFolder === 'general') return 'General Inbox';
+    if (activeFolder === 'trash') return 'Trash';
     return rules.find((r) => r.id === activeFolder)?.name || activeFolder;
   }, [activeFolder, rules]);
 
@@ -218,6 +270,22 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
     setMobileMenuOpen(false);
   };
 
+  const handleOpenCompose = () => {
+    setMobileMenuOpen(false);
+    setIsComposeOpen(true);
+  };
+
+  const handleConfirmPermanentAction = async () => {
+    if (!pendingConfirm) return;
+    const action = pendingConfirm;
+    setPendingConfirm(null);
+    if (action.type === 'delete_forever') {
+      await onDeleteForeverMessage(action.message);
+    } else if (action.type === 'empty_trash') {
+      await onEmptyTrash();
+    }
+  };
+
   // Automatically hydrate full HTML body & attachments on demand when an email is clicked/opened
   useEffect(() => {
     if (selectedMessage && selectedMessage.fullBodyLoaded === false) {
@@ -233,11 +301,13 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   // Keyboard shortcuts: Escape closes expanded/mobile reader, Up/Down navigates emails
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isComposeOpen || pendingConfirm) return;
       const target = e.target as HTMLElement | null;
       const isTyping =
         target &&
         (target.tagName === 'INPUT' ||
           target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
           target.isContentEditable);
       if (isTyping) return;
 
@@ -266,7 +336,15 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [filteredMessages, isDesktopExpanded, isMobileReaderOpen, onToggleReadState, selectedIndex]);
+  }, [
+    filteredMessages,
+    isComposeOpen,
+    isDesktopExpanded,
+    isMobileReaderOpen,
+    onToggleReadState,
+    pendingConfirm,
+    selectedIndex,
+  ]);
 
   const renderProviderIcon = () => {
     if (account.provider === 'gmail') return <GoogleGIcon className="w-4 h-4 shrink-0" />;
@@ -298,7 +376,7 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
       </div>
 
       {/* Connected Account Summary */}
-      <div className="px-5 py-4 border-b border-slate-200 space-y-2.5">
+      <div className="px-5 py-3.5 border-b border-slate-200 space-y-2.5">
         <div className="flex items-center gap-2.5 min-w-0">
           {renderProviderIcon()}
           <div className="min-w-0 flex-1">
@@ -310,8 +388,20 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
         </div>
       </div>
 
-      {/* Mailboxes List Only */}
-      <nav className="flex-1 overflow-y-auto mail-scroll px-3 py-4 space-y-1">
+      {/* Prominent Compose Button above Mailboxes */}
+      <div className="px-3 pt-4 pb-1 shrink-0">
+        <button
+          type="button"
+          onClick={handleOpenCompose}
+          className="w-full h-10 px-3.5 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors shadow-xs cursor-pointer"
+        >
+          <PenSquare className="w-4 h-4 shrink-0" />
+          <span>Compose</span>
+        </button>
+      </div>
+
+      {/* Mailboxes List */}
+      <nav className="flex-1 overflow-y-auto mail-scroll px-3 py-3 space-y-1">
         <div className="px-2.5 pb-1.5 text-[11px] font-semibold text-slate-500">Mailboxes</div>
 
         <button
@@ -376,6 +466,27 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
             {folderCounts.general || 0}
           </span>
         </button>
+
+        {/* Trash Folder at the bottom of Mailboxes */}
+        <div className="pt-2 mt-2 border-t border-slate-100">
+          <button
+            type="button"
+            onClick={() => handleSwitchFolder('trash')}
+            className={`w-full px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 text-sm transition-colors cursor-pointer ${
+              activeFolder === 'trash'
+                ? 'bg-slate-100 text-slate-950 font-semibold'
+                : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950 font-medium'
+            }`}
+          >
+            <span className="flex items-center gap-2.5 truncate">
+              <Trash2 className="w-4 h-4 text-slate-400 shrink-0" />
+              <span className="truncate">Trash</span>
+            </span>
+            <span className="font-mono tabular-nums text-xs text-slate-500">
+              {folderCounts.trash || 0}
+            </span>
+          </button>
+        </div>
       </nav>
 
       {/* Share & Sign Out Footer */}
@@ -520,10 +631,10 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
           >
             <span className="leading-relaxed">{errorMessage}</span>
             <div className="flex items-center gap-3 shrink-0">
-              {account.provider === 'gmail' && onReauthorizeGmail && (
+              {account.provider === 'gmail' && (
                 <button
                   type="button"
-                  onClick={onReauthorizeGmail}
+                  onClick={() => void onReauthorizeGmail()}
                   className="font-semibold text-blue-800 underline whitespace-nowrap cursor-pointer"
                 >
                   Re-authorize Gmail
@@ -550,31 +661,63 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
               isDesktopExpanded && selectedMessage ? 'md:hidden' : 'md:flex'
             } w-full md:w-[370px] xl:w-[410px] bg-white border-r border-slate-200 flex-col min-h-0 shrink-0`}
           >
-            {/* Filter sub-bar */}
+            {/* Filter sub-bar (with Empty Trash action when viewing Trash) */}
             <div className="px-4 py-2.5 border-b border-slate-200 flex items-center justify-between gap-3 shrink-0">
-              <div className="inline-flex items-center gap-1 p-0.5 bg-slate-100 rounded-md">
-                <button
-                  type="button"
-                  onClick={() => setUnreadOnly(false)}
-                  className={`px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
-                    !unreadOnly ? 'bg-white text-slate-950 shadow-2xs' : 'text-slate-600'
-                  }`}
-                >
-                  All
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setUnreadOnly(true)}
-                  className={`px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
-                    unreadOnly ? 'bg-white text-slate-950 shadow-2xs' : 'text-slate-600'
-                  }`}
-                >
-                  Unread
-                </button>
-              </div>
-              <span className="text-xs font-mono tabular-nums text-slate-500">
-                {filteredMessages.length} messages
-              </span>
+              {activeFolder === 'trash' ? (
+                <>
+                  <span className="text-xs font-mono tabular-nums text-slate-600">
+                    {filteredMessages.length} in Trash
+                  </span>
+                  {folderCounts.trash > 0 && (
+                    <button
+                      type="button"
+                      disabled={isEmptyingTrash}
+                      onClick={() =>
+                        setPendingConfirm({ type: 'empty_trash', count: folderCounts.trash })
+                      }
+                      className="h-7 px-2.5 text-xs font-semibold text-rose-700 hover:text-rose-900 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-md inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      {isEmptyingTrash ? (
+                        <>
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          <span>Emptying...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Trash2 className="w-3 h-3" />
+                          <span>Empty Trash</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="inline-flex items-center gap-1 p-0.5 bg-slate-100 rounded-md">
+                    <button
+                      type="button"
+                      onClick={() => setUnreadOnly(false)}
+                      className={`px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
+                        !unreadOnly ? 'bg-white text-slate-950 shadow-2xs' : 'text-slate-600'
+                      }`}
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setUnreadOnly(true)}
+                      className={`px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
+                        unreadOnly ? 'bg-white text-slate-950 shadow-2xs' : 'text-slate-600'
+                      }`}
+                    >
+                      Unread
+                    </button>
+                  </div>
+                  <span className="text-xs font-mono tabular-nums text-slate-500">
+                    {filteredMessages.length} messages
+                  </span>
+                </>
+              )}
             </div>
 
             {/* Mobile search input */}
@@ -609,27 +752,34 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
               ) : filteredMessages.length === 0 ? (
                 <div className="px-6 py-14 text-center space-y-3">
                   <p className="text-sm font-semibold text-slate-900">
-                    No emails in {activeFolderLabel}
+                    {activeFolder === 'trash'
+                      ? 'Trash is empty'
+                      : `No emails in ${activeFolderLabel}`}
                   </p>
                   <p className="text-xs text-slate-500 leading-relaxed max-w-xs mx-auto">
-                    {messages.length === 0
+                    {activeFolder === 'trash'
+                      ? 'Deleted emails appear here until you restore them or delete them forever.'
+                      : messages.length === 0
                       ? 'Sync your inbox to load recent messages and categorize them automatically.'
                       : 'No messages currently match this mailbox or search filter.'}
                   </p>
-                  <div className="pt-2 flex items-center justify-center">
-                    <button
-                      type="button"
-                      onClick={onSyncInbox}
-                      className="px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg cursor-pointer"
-                    >
-                      Sync Inbox
-                    </button>
-                  </div>
+                  {activeFolder !== 'trash' && (
+                    <div className="pt-2 flex items-center justify-center">
+                      <button
+                        type="button"
+                        onClick={onSyncInbox}
+                        className="px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg cursor-pointer"
+                      >
+                        Sync Inbox
+                      </button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <>
                   {visibleMessages.map((msg) => {
                     const isSelected = selectedMessage?.id === msg.id;
+                    const trashed = isMessageTrashed(msg);
                     const matchedRule = getRuleById(msg.classification?.categoryId);
                     const attachmentCount = msg.attachments?.filter((a) => a.filename).length || 0;
                     const cleanFrom = decodeHtmlEntities(msg.fromName || msg.fromEmail);
@@ -637,63 +787,86 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                     const cleanSnippet = decodeHtmlEntities(msg.snippet || '');
 
                     return (
-                      <button
+                      <div
                         key={msg.id}
-                        type="button"
-                        onClick={() => handleOpenMessage(msg, false)}
-                        onDoubleClick={() => handleOpenMessage(msg, true)}
-                        className={`w-full text-left px-4 py-3.5 transition-colors cursor-pointer block ${
+                        className={`group relative transition-colors ${
                           isSelected ? 'bg-slate-100/90' : 'bg-white hover:bg-slate-50'
                         }`}
                       >
-                        <div className="flex items-baseline justify-between gap-3">
-                          <span
-                            className={`text-sm truncate ${
+                        <button
+                          type="button"
+                          onClick={() => handleOpenMessage(msg, false)}
+                          onDoubleClick={() => handleOpenMessage(msg, true)}
+                          className="w-full text-left px-4 py-3.5 cursor-pointer block pr-10"
+                        >
+                          <div className="flex items-baseline justify-between gap-3">
+                            <span
+                              className={`text-sm truncate ${
+                                msg.unread
+                                  ? 'font-bold text-slate-950'
+                                  : 'font-medium text-slate-800'
+                              }`}
+                            >
+                              {cleanFrom}
+                            </span>
+                            <span className="text-[11px] font-mono tabular-nums text-slate-500 shrink-0">
+                              {formatShortDate(msg.dateIso)}
+                            </span>
+                          </div>
+
+                          <div
+                            className={`mt-0.5 text-xs truncate ${
                               msg.unread
-                                ? 'font-bold text-slate-950'
-                                : 'font-medium text-slate-800'
+                                ? 'font-semibold text-slate-900'
+                                : 'font-normal text-slate-700'
                             }`}
                           >
-                            {cleanFrom}
-                          </span>
-                          <span className="text-[11px] font-mono tabular-nums text-slate-500 shrink-0">
-                            {formatShortDate(msg.dateIso)}
-                          </span>
-                        </div>
+                            {cleanSubject}
+                          </div>
 
-                        <div
-                          className={`mt-0.5 text-xs truncate ${
-                            msg.unread
-                              ? 'font-semibold text-slate-900'
-                              : 'font-normal text-slate-700'
-                          }`}
-                        >
-                          {cleanSubject}
-                        </div>
+                          <p className="mt-1 text-xs text-slate-500 line-clamp-1">{cleanSnippet}</p>
 
-                        <p className="mt-1 text-xs text-slate-500 line-clamp-1">{cleanSnippet}</p>
-
-                        <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 flex-wrap">
-                          {matchedRule ? (
-                            <span
-                              className={`font-semibold ${ACCENT_TEXT_CLASS[matchedRule.accent]}`}
-                            >
-                              {matchedRule.shortName}
-                            </span>
-                          ) : (
-                            <span className="font-medium text-slate-500">General</span>
-                          )}
-                          {attachmentCount > 0 && (
-                            <>
-                              <span aria-hidden="true">·</span>
-                              <span className="inline-flex items-center gap-1 text-slate-600">
-                                <Paperclip className="w-3 h-3 shrink-0" />
-                                <span className="font-mono tabular-nums">{attachmentCount}</span>
+                          <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 flex-wrap">
+                            {trashed ? (
+                              <span className="font-medium text-slate-500">Trash</span>
+                            ) : matchedRule ? (
+                              <span
+                                className={`font-semibold ${ACCENT_TEXT_CLASS[matchedRule.accent]}`}
+                              >
+                                {matchedRule.shortName}
                               </span>
-                            </>
-                          )}
-                        </div>
-                      </button>
+                            ) : (
+                              <span className="font-medium text-slate-500">General</span>
+                            )}
+                            {attachmentCount > 0 && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="inline-flex items-center gap-1 text-slate-600">
+                                  <Paperclip className="w-3 h-3 shrink-0" />
+                                  <span className="font-mono tabular-nums">{attachmentCount}</span>
+                                </span>
+                              </>
+                            )}
+                          </div>
+                        </button>
+
+                        {/* Subtle hover Delete icon on each non-trashed email row */}
+                        {!trashed && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void onTrashMessage(msg);
+                            }}
+                            disabled={busyActionMessageId === msg.id}
+                            title="Move to Trash"
+                            aria-label={`Delete ${cleanSubject}`}
+                            className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-md text-slate-400 hover:text-rose-700 hover:bg-rose-50 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity cursor-pointer disabled:opacity-40"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
                     );
                   })}
 
@@ -711,7 +884,7 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                   )}
 
                   {/* Subtle Load Older Mail button at the bottom of the email list */}
-                  {syncProgress.hasMore && (
+                  {activeFolder !== 'trash' && syncProgress.hasMore && (
                     <div className="p-3.5 text-center bg-slate-50/50">
                       <button
                         type="button"
@@ -745,11 +918,13 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
               <EmailReaderView
                 message={selectedMessage}
                 rules={rules}
+                isTrashed={isMessageTrashed(selectedMessage)}
                 currentIndex={selectedIndex}
                 totalCount={filteredMessages.length}
                 isExpanded={isDesktopExpanded}
                 isLoadingFullBody={loadingFullMessageId === selectedMessage.id}
                 isReclassifying={reclassifyingMessageId === selectedMessage.id}
+                isActionBusy={busyActionMessageId === selectedMessage.id}
                 onBackMobile={() => setIsMobileReaderOpen(false)}
                 onToggleExpand={() => setIsDesktopExpanded((prev) => !prev)}
                 onSelectPrevious={() => handleStepMessage(-1)}
@@ -758,6 +933,11 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                 onDownloadAttachment={onDownloadAttachment}
                 onManualReclassifyMessage={onManualReclassifyMessage}
                 onManualMoveMessage={onManualMoveMessage}
+                onTrashMessage={(msg) => void onTrashMessage(msg)}
+                onRestoreMessage={(msg) => void onRestoreMessage(msg)}
+                onDeleteForeverMessage={(msg) =>
+                  setPendingConfirm({ type: 'delete_forever', message: msg })
+                }
               />
             ) : (
               <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
@@ -773,6 +953,82 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
           </main>
         </div>
       </div>
+
+      {/* Floating Compose Modal */}
+      <ComposeModal
+        isOpen={isComposeOpen}
+        fromEmail={account.email}
+        needsPermissionReauth={needsMailActionScopeReauth}
+        onClose={() => setIsComposeOpen(false)}
+        onReauthorizeGmail={onReauthorizeGmail}
+        onSendEmail={onSendEmail}
+      />
+
+      {/* Explicit Confirmation Modal for Delete Forever & Empty Trash */}
+      {pendingConfirm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/40"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="confirm-dialog-title"
+        >
+          <div className="w-full max-w-sm bg-white border border-slate-200 rounded-xl shadow-2xl p-6 space-y-4">
+            <div className="space-y-1.5">
+              <h3 id="confirm-dialog-title" className="text-base font-bold text-slate-950">
+                {pendingConfirm.type === 'empty_trash'
+                  ? `Empty Trash (${pendingConfirm.count} ${
+                      pendingConfirm.count === 1 ? 'message' : 'messages'
+                    })?`
+                  : 'Delete message forever?'}
+              </h3>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                {pendingConfirm.type === 'empty_trash'
+                  ? `This will permanently delete all ${pendingConfirm.count} ${
+                      pendingConfirm.count === 1 ? 'email' : 'emails'
+                    } in Trash from Gmail and your browser cache. This action cannot be undone.`
+                  : `"${decodeHtmlEntities(
+                      pendingConfirm.message.subject || '(No Subject)'
+                    )}" will be permanently deleted from Gmail and cannot be recovered.`}
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setPendingConfirm(null)}
+                className="h-9 px-3.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmPermanentAction()}
+                className="h-9 px-3.5 text-xs font-semibold text-white bg-rose-700 hover:bg-rose-800 rounded-lg cursor-pointer"
+              >
+                {pendingConfirm.type === 'empty_trash' ? 'Empty Trash' : 'Delete Forever'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clean Floating Toast Notification */}
+      {toastMessage && (
+        <div
+          role="status"
+          className="fixed bottom-5 left-1/2 -translate-x-1/2 sm:left-6 sm:translate-x-0 z-50 px-4 py-2.5 bg-slate-900 text-white text-xs font-medium rounded-lg shadow-lg flex items-center gap-3"
+        >
+          <span>{toastMessage}</span>
+          <button
+            type="button"
+            onClick={onDismissToast}
+            className="text-slate-400 hover:text-white cursor-pointer"
+            aria-label="Dismiss notification"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
     </div>
   );
 };

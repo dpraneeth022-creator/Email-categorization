@@ -15,6 +15,8 @@ import {
   Minimize2,
   Paperclip,
   RefreshCw,
+  RotateCcw,
+  Trash2,
 } from 'lucide-react';
 import { decodeHtmlEntities } from '../shared/classifierRules';
 import type { ClassificationRule, MailAttachment, MailMessage } from '../shared/types';
@@ -22,11 +24,13 @@ import type { ClassificationRule, MailAttachment, MailMessage } from '../shared/
 interface EmailReaderViewProps {
   message: MailMessage;
   rules: ClassificationRule[];
+  isTrashed: boolean;
   currentIndex: number;
   totalCount: number;
   isExpanded: boolean;
   isLoadingFullBody?: boolean;
   isReclassifying?: boolean;
+  isActionBusy?: boolean;
   onBackMobile: () => void;
   onToggleExpand: () => void;
   onSelectPrevious: () => void;
@@ -35,6 +39,9 @@ interface EmailReaderViewProps {
   onDownloadAttachment: (message: MailMessage, attachment: MailAttachment) => Promise<void>;
   onManualReclassifyMessage: (message: MailMessage) => void;
   onManualMoveMessage: (messageId: string, targetCategoryId: string) => void;
+  onTrashMessage: (message: MailMessage) => void;
+  onRestoreMessage: (message: MailMessage) => void;
+  onDeleteForeverMessage: (message: MailMessage) => void;
 }
 
 function formatFullDate(iso: string): string {
@@ -180,11 +187,13 @@ function renderLinkifiedText(text: string): React.ReactNode[] {
 export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
   message,
   rules,
+  isTrashed,
   currentIndex,
   totalCount,
   isExpanded,
   isLoadingFullBody = false,
   isReclassifying = false,
+  isActionBusy = false,
   onBackMobile,
   onToggleExpand,
   onSelectPrevious,
@@ -193,6 +202,9 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
   onDownloadAttachment,
   onManualReclassifyMessage,
   onManualMoveMessage,
+  onTrashMessage,
+  onRestoreMessage,
+  onDeleteForeverMessage,
 }) => {
   const hasHtml = Boolean(message.bodyHtml && message.bodyHtml.trim().length > 0);
   const [iframeHeight, setIframeHeight] = useState<number>(420);
@@ -366,53 +378,96 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          <label className="sr-only" htmlFor="reader-move-category">
-            Move email to mailbox
-          </label>
-          <select
-            id="reader-move-category"
-            value={message.classification?.categoryId || 'general'}
-            onChange={(e) => onManualMoveMessage(message.id, e.target.value)}
-            title="Move email to another mailbox"
-            className="h-8 max-w-[128px] px-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:border-slate-300 rounded-lg focus:outline-none focus:border-blue-600 transition-colors cursor-pointer"
-          >
-            {rules.map((rule) => (
-              <option key={rule.id} value={rule.id}>
-                {rule.shortName}
-              </option>
-            ))}
-            <option value="general">General</option>
-          </select>
+          {!isTrashed ? (
+            <>
+              <label className="sr-only" htmlFor="reader-move-category">
+                Move email to mailbox
+              </label>
+              <select
+                id="reader-move-category"
+                value={message.classification?.categoryId || 'general'}
+                onChange={(e) => onManualMoveMessage(message.id, e.target.value)}
+                title="Move email to another mailbox"
+                className="h-8 max-w-[120px] px-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:border-slate-300 rounded-lg focus:outline-none focus:border-blue-600 transition-colors cursor-pointer"
+              >
+                {rules.map((rule) => (
+                  <option key={rule.id} value={rule.id}>
+                    {rule.shortName}
+                  </option>
+                ))}
+                <option value="general">General</option>
+              </select>
 
-          <button
-            type="button"
-            onClick={() => onManualReclassifyMessage(message)}
-            disabled={isReclassifying}
-            className="h-8 px-2.5 text-xs font-medium text-slate-700 hover:text-slate-950 hover:bg-slate-100 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-            title="Re-classify this email"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isReclassifying ? 'animate-spin' : ''}`} />
-            <span className="hidden lg:inline">{isReclassifying ? 'Classifying...' : 'Re-classify'}</span>
-          </button>
+              <button
+                type="button"
+                onClick={() => onManualReclassifyMessage(message)}
+                disabled={isReclassifying}
+                className="h-8 px-2 text-xs font-medium text-slate-700 hover:text-slate-950 hover:bg-slate-100 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                title="Re-classify this email"
+              >
+                <RefreshCw
+                  className={`w-3.5 h-3.5 shrink-0 ${isReclassifying ? 'animate-spin' : ''}`}
+                />
+                <span className="hidden xl:inline">
+                  {isReclassifying ? 'Classifying...' : 'Re-classify'}
+                </span>
+              </button>
 
-          <button
-            type="button"
-            onClick={() => onToggleReadState(message.id, !message.unread)}
-            className="h-8 px-2.5 text-xs font-medium text-slate-700 hover:text-slate-950 hover:bg-slate-100 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            title={message.unread ? 'Mark as read' : 'Mark as unread'}
-          >
-            {message.unread ? (
-              <>
-                <MailCheck className="w-3.5 h-3.5 shrink-0" />
-                <span className="hidden sm:inline">Mark Read</span>
-              </>
-            ) : (
-              <>
-                <MailOpen className="w-3.5 h-3.5 shrink-0" />
-                <span className="hidden sm:inline">Mark Unread</span>
-              </>
-            )}
-          </button>
+              <button
+                type="button"
+                onClick={() => onToggleReadState(message.id, !message.unread)}
+                className="h-8 px-2.5 text-xs font-medium text-slate-700 hover:text-slate-950 hover:bg-slate-100 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                title={message.unread ? 'Mark as read' : 'Mark as unread'}
+              >
+                {message.unread ? (
+                  <>
+                    <MailCheck className="w-3.5 h-3.5 shrink-0" />
+                    <span className="hidden sm:inline">Mark Read</span>
+                  </>
+                ) : (
+                  <>
+                    <MailOpen className="w-3.5 h-3.5 shrink-0" />
+                    <span className="hidden sm:inline">Mark Unread</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => onTrashMessage(message)}
+                disabled={isActionBusy}
+                className="h-8 px-2.5 text-xs font-medium text-slate-700 hover:text-rose-700 hover:bg-rose-50 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                title="Move to Trash"
+              >
+                <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden sm:inline">Delete</span>
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => onRestoreMessage(message)}
+                disabled={isActionBusy}
+                className="h-8 px-3 text-xs font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                title="Restore email from Trash"
+              >
+                <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                <span>Restore</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => onDeleteForeverMessage(message)}
+                disabled={isActionBusy}
+                className="h-8 px-3 text-xs font-semibold text-rose-800 bg-rose-50 border border-rose-200 hover:bg-rose-100 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                title="Permanently delete this email"
+              >
+                <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                <span>Delete Forever</span>
+              </button>
+            </>
+          )}
 
           {message.webLink && (
             <a

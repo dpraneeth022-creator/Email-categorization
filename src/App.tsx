@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AuthLanding } from './components/AuthLanding';
+import type { ComposeDraftPayload } from './components/ComposeModal';
 import { MailWorkspace } from './components/MailWorkspace';
 import {
   checkGoogleRedirectResult,
   getGmailAccessToken,
   googleLogout,
   googleSignIn,
+  hasFullMailActionScopes,
   initGoogleAuth,
   invalidateGmailAccessToken,
   isGmailTokenExpired,
@@ -14,6 +16,7 @@ import {
   updatePersistedLastSync,
 } from './lib/firebaseAuth';
 import {
+  deleteCachedMessages,
   loadCachedMailbox,
   loadSavedClassifications,
   saveCachedClassifications,
@@ -98,7 +101,11 @@ function deduplicateAndSortMessages(list: MailMessage[]): MailMessage[] {
 
   const byThread = new Map<string, MailMessage>();
   for (const msg of byId.values()) {
-    const threadKey = msg.threadId ? `thread:${msg.threadId}` : `id:${msg.id}`;
+    // Keep trashed vs active thread entries separated by trash state so moving a single message works cleanly
+    const isTrashed = Boolean(msg.labelIds?.includes('TRASH'));
+    const threadKey = msg.threadId
+      ? `${isTrashed ? 'trash:' : 'active:'}thread:${msg.threadId}`
+      : `id:${msg.id}`;
     const existing = byThread.get(threadKey);
     if (!existing) {
       byThread.set(threadKey, msg);
@@ -127,13 +134,13 @@ function deduplicateAndSortMessages(list: MailMessage[]): MailMessage[] {
 function getLatestMessageEpochSeconds(list: MailMessage[]): number | null {
   let latestMs = 0;
   for (const msg of list) {
+    if (msg.labelIds?.includes('TRASH')) continue;
     const ms = Date.parse(msg.dateIso);
     if (Number.isFinite(ms) && ms > latestMs) {
       latestMs = ms;
     }
   }
   if (latestMs <= 0) return null;
-  // Subtract 60s safety overlap (excludeIds guarantees cached IDs are skipped)
   return Math.max(0, Math.floor(latestMs / 1000) - 60);
 }
 
@@ -162,6 +169,10 @@ export default function App() {
     const sess = initialSessionRef.current;
     return Boolean(sess && isGmailTokenExpired(sess.account.email));
   });
+  const [needsMailActionScopeReauth, setNeedsMailActionScopeReauth] = useState<boolean>(() => {
+    const sess = initialSessionRef.current;
+    return Boolean(sess && !hasFullMailActionScopes(sess.account.email));
+  });
 
   const [providerStatus, setProviderStatus] = useState<ProviderConfigStatus | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
@@ -176,8 +187,11 @@ export default function App() {
   const [isClassifying, setIsClassifying] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [loadingFullMessageId, setLoadingFullMessageId] = useState<string | null>(null);
   const [reclassifyingMessageId, setReclassifyingMessageId] = useState<string | null>(null);
+  const [busyActionMessageId, setBusyActionMessageId] = useState<string | null>(null);
+  const [isEmptyingTrash, setIsEmptyingTrash] = useState(false);
 
   const [syncProgress, setSyncProgress] = useState<SyncProgressState>({
     isRunning: false,
@@ -189,6 +203,7 @@ export default function App() {
   });
 
   const syncRunIdRef = useRef(0);
+  const toastTimerRef = useRef<number | null>(null);
   const nextPageTokenRef = useRef<string | null>(null);
   const totalEstimateRef = useRef<number | null>(null);
   const latestTimestampRef = useRef<number | null>(null);
@@ -212,6 +227,17 @@ export default function App() {
       ? providerStatus.campus.allowedDomains
       : DEFAULT_ALLOWED_CAMPUS_DOMAINS;
 
+  const showToast = useCallback((text: string) => {
+    setToastMessage(text);
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setToastMessage(null);
+      toastTimerRef.current = null;
+    }, 3200);
+  }, []);
+
   // Load campus domain config on mount
   useEffect(() => {
     fetch('/api/auth/providers')
@@ -222,6 +248,35 @@ export default function App() {
       .catch(() => {
         // Ignore non-critical startup fetch error
       });
+  }, []);
+
+  /**
+   * Ensures we have a fresh Gmail access token with full send/modify/delete permissions.
+   * Prompts Google re-authorization cleanly when current session lacks the required scopes.
+   */
+  const ensureMailActionToken = useCallback(async (forceConsent = false): Promise<string | null> => {
+    const acctEmail = accountRef.current?.email;
+    if (!forceConsent && hasFullMailActionScopes(acctEmail)) {
+      const existing = getGmailAccessToken(acctEmail);
+      if (existing) {
+        setNeedsGmailReconnect(false);
+        setNeedsMailActionScopeReauth(false);
+        return existing;
+      }
+    }
+
+    const result = await googleSignIn(
+      true,
+      allowedDomainsRef.current,
+      keepSignedInRef.current,
+      acctEmail
+    );
+    const token = result?.accessToken || getGmailAccessToken(acctEmail);
+    if (token) {
+      setNeedsGmailReconnect(false);
+      setNeedsMailActionScopeReauth(false);
+    }
+    return token;
   }, []);
 
   /**
@@ -507,7 +562,6 @@ export default function App() {
         phaseLabel: '',
       });
 
-      // Classify ONLY emails that have never been classified before (strictly skips already-classified IDs)
       const unclassified = deduped.filter((m) => !m.classification?.categoryId);
       if (unclassified.length > 0) {
         await classifyMessages(unclassified, rulesRef.current, feedbackRef.current, {
@@ -536,6 +590,7 @@ export default function App() {
         pageToken?: string;
         excludeIds: string[];
         afterTimestamp?: number;
+        labelId?: string;
       },
       runId: number
     ): Promise<{
@@ -603,7 +658,9 @@ export default function App() {
         }
 
         const isRateLimited =
-          res.status === 429 || data.code === 'GMAIL_RATE_LIMITED' || Boolean(data.rateLimited && !res.ok);
+          res.status === 429 ||
+          data.code === 'GMAIL_RATE_LIMITED' ||
+          Boolean(data.rateLimited && !res.ok);
 
         if (isRateLimited) {
           setStatusMessage(RATE_LIMIT_FRIENDLY_MESSAGE);
@@ -648,11 +705,11 @@ export default function App() {
   );
 
   /**
-   * Incremental Sync Inbox:
+   * Incremental Sync Inbox + Gmail TRASH Sync:
    * 1. Hydrates cached emails instantaneously from IndexedDB (and runs one-time EL migration).
-   * 2. Only fetches NEW emails arrived after the latest cached timestamp (plus excludeIds).
-   * 3. Classifies ONLY brand-new emails that do not yet exist in IndexedDB's classification store.
-   * 4. Never forces sign-out if the 1-hour Gmail token expired — refreshes token on user click or shows subtle banner.
+   * 2. Only fetches NEW inbox emails arrived after the latest cached timestamp (plus excludeIds).
+   * 3. Also syncs Gmail's TRASH label so emails deleted directly in Gmail appear in NexaMAIL's Trash folder.
+   * 4. Classifies ONLY brand-new emails that do not yet exist in IndexedDB's classification store.
    */
   const syncInbox = useCallback(
     async (
@@ -680,7 +737,6 @@ export default function App() {
       const activeFeedback = feedbackRef.current;
 
       try {
-        // Hydrate from IndexedDB first if not yet hydrated for this account
         if (
           options?.hydrateCacheFirst ||
           hydratedAccountRef.current !== connected.email.toLowerCase()
@@ -695,8 +751,6 @@ export default function App() {
         let accessToken = options?.tokenOverride || getGmailAccessToken(connected.email);
         if (!accessToken) {
           if (!interactiveAuth) {
-            // Background auto-sync on Chrome reopen with expired 1h token:
-            // keep cached inbox visible & show subtle reconnect banner without blocking UI
             setNeedsGmailReconnect(true);
             return false;
           }
@@ -712,9 +766,7 @@ export default function App() {
           } catch (authErr) {
             setNeedsGmailReconnect(true);
             throw new Error(
-              authErr instanceof Error
-                ? authErr.message
-                : 'Reconnect Gmail to sync new emails.'
+              authErr instanceof Error ? authErr.message : 'Reconnect Gmail to sync new emails.'
             );
           }
         }
@@ -725,6 +777,7 @@ export default function App() {
         }
 
         setNeedsGmailReconnect(false);
+        setNeedsMailActionScopeReauth(!hasFullMailActionScopes(connected.email));
 
         if (isLoadOlder) {
           const pageToken = nextPageTokenRef.current;
@@ -796,11 +849,13 @@ export default function App() {
         }
 
         // Incremental Sync Inbox:
-        // If we already have cached emails, query Gmail ONLY for emails after the latest cached timestamp!
-        const isInitialEmptySync = cachedIds.size === 0;
+        const nonTrashMessages = currentMessages.filter((m) => !m.labelIds?.includes('TRASH'));
+        const isInitialEmptySync = nonTrashMessages.length === 0;
         const afterTimestamp = isInitialEmptySync
           ? undefined
-          : getLatestMessageEpochSeconds(currentMessages) ?? latestTimestampRef.current ?? undefined;
+          : getLatestMessageEpochSeconds(nonTrashMessages) ??
+            latestTimestampRef.current ??
+            undefined;
         const maxIncrementalPages = isInitialEmptySync ? 2 : 4;
         let pageToken: string | undefined = undefined;
         let pagesFetched = 0;
@@ -835,7 +890,6 @@ export default function App() {
             );
           }
 
-          // Preserve oldest pagination cursor ONLY during initial full-inbox walk (never overwrite with filtered after: query cursor)
           if (isInitialEmptySync) {
             nextPageTokenRef.current = page.nextPageToken;
           }
@@ -849,7 +903,6 @@ export default function App() {
             currentMessages = merged;
             setMessages(merged);
             await saveCachedMessages(connected.email, freshMessages);
-            // Strictly classify ONLY newly fetched emails
             await classifyMessages(freshMessages, activeRules, activeFeedback, {
               runId,
               accountEmail: connected.email,
@@ -874,6 +927,48 @@ export default function App() {
           }
 
           pageToken = page.nextPageToken;
+        }
+
+        // Also sync Gmail's TRASH label so messages deleted in Gmail appear in NexaMAIL's Trash folder
+        if (syncRunIdRef.current === runId) {
+          const existingTrashIds = messagesRef.current
+            .filter((m) => m.labelIds?.includes('TRASH'))
+            .map((m) => m.id);
+
+          const trashPage = await requestGmailSyncPageWithBackoff(
+            accessToken,
+            {
+              maxResults: 50,
+              labelId: 'TRASH',
+              excludeIds: existingTrashIds,
+            },
+            runId
+          );
+
+          if (syncRunIdRef.current === runId && !trashPage.tokenExpired && trashPage.messages.length > 0) {
+            const normalizedTrash = trashPage.messages.map((m) => {
+              const existing = messagesRef.current.find((prev) => prev.id === m.id);
+              const nextLabels = Array.from(new Set([...(m.labelIds || []), 'TRASH'])).filter(
+                (l) => l !== 'INBOX'
+              );
+              return {
+                ...(existing || {}),
+                ...m,
+                labelIds: nextLabels,
+                classification: existing?.classification || m.classification,
+              };
+            });
+
+            const trashIdSet = new Set(normalizedTrash.map((m) => m.id));
+            const withoutReplaced = messagesRef.current.filter((m) => !trashIdSet.has(m.id));
+            const mergedWithTrash = deduplicateAndSortMessages([
+              ...normalizedTrash,
+              ...withoutReplaced,
+            ]);
+            messagesRef.current = mergedWithTrash;
+            setMessages(mergedWithTrash);
+            await saveCachedMessages(connected.email, normalizedTrash);
+          }
         }
 
         const now = Date.now();
@@ -937,6 +1032,431 @@ export default function App() {
   }, []);
 
   /**
+   * Sends a composed email via Gmail API (RFC 2822 base64url) and shows toast confirmation.
+   */
+  const handleSendEmail = useCallback(
+    async (
+      draft: ComposeDraftPayload
+    ): Promise<{ ok: boolean; error?: string; needsReauth?: boolean }> => {
+      try {
+        let token = getGmailAccessToken(accountRef.current?.email);
+        if (!token || !hasFullMailActionScopes(accountRef.current?.email)) {
+          try {
+            token = await ensureMailActionToken(true);
+          } catch (authErr) {
+            setNeedsMailActionScopeReauth(true);
+            return {
+              ok: false,
+              needsReauth: true,
+              error:
+                authErr instanceof Error
+                  ? authErr.message
+                  : 'Re-authorize Google with Gmail Send permission to send emails.',
+            };
+          }
+        }
+
+        if (!token) {
+          setNeedsMailActionScopeReauth(true);
+          return {
+            ok: false,
+            needsReauth: true,
+            error: 'Re-authorize Google to send this email.',
+          };
+        }
+
+        const res = await fetch('/api/gmail/send', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(draft),
+        });
+
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          code?: string;
+          error?: string;
+        };
+
+        if (res.status === 401 || data.code === 'TOKEN_EXPIRED') {
+          invalidateGmailAccessToken();
+          setNeedsGmailReconnect(true);
+          setNeedsMailActionScopeReauth(true);
+          return {
+            ok: false,
+            needsReauth: true,
+            error: 'Your Gmail session expired. Click Re-authorize to send.',
+          };
+        }
+
+        if (res.status === 403 || data.code === 'INSUFFICIENT_SCOPE') {
+          setNeedsMailActionScopeReauth(true);
+          return {
+            ok: false,
+            needsReauth: true,
+            error:
+              'Gmail Send permission is required. Click Re-authorize to grant permission and send.',
+          };
+        }
+
+        if (!res.ok) {
+          return {
+            ok: false,
+            error: data.error || 'Could not send email. Please try again.',
+          };
+        }
+
+        showToast('Message sent');
+        return { ok: true };
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Unable to send email right now.',
+        };
+      }
+    },
+    [ensureMailActionToken, showToast]
+  );
+
+  /**
+   * Moves an email to Trash optimistically in UI + IndexedDB and calls Gmail messages.trash.
+   */
+  const handleTrashMessage = useCallback(
+    async (message: MailMessage) => {
+      const acctEmail = accountRef.current?.email;
+      if (!acctEmail) return;
+
+      setWorkspaceError(null);
+
+      let token = getGmailAccessToken(acctEmail);
+      if (!token || !hasFullMailActionScopes(acctEmail)) {
+        try {
+          token = await ensureMailActionToken(true);
+        } catch (authErr) {
+          setNeedsMailActionScopeReauth(true);
+          setWorkspaceError(
+            authErr instanceof Error
+              ? authErr.message
+              : 'Re-authorize Google with Gmail Modify permission to delete emails.'
+          );
+          return;
+        }
+      }
+
+      if (!token) {
+        setNeedsMailActionScopeReauth(true);
+        setWorkspaceError('Re-authorize Gmail to delete emails.');
+        return;
+      }
+
+      // Optimistic UI update: immediately remove from current mailbox & All Mail and move to Trash
+      const previousSnapshot = message;
+      const trashedMsg: MailMessage = {
+        ...message,
+        labelIds: Array.from(new Set([...(message.labelIds || []), 'TRASH'])).filter(
+          (l) => l !== 'INBOX'
+        ),
+      };
+
+      setBusyActionMessageId(message.id);
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? trashedMsg : m)));
+      void saveCachedMessages(acctEmail, [trashedMsg]);
+
+      try {
+        const res = await fetch(`/api/gmail/messages/${encodeURIComponent(message.id)}/trash`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          code?: string;
+          error?: string;
+          labelIds?: string[];
+        };
+
+        if (!res.ok) {
+          // Rollback optimistic update on failure
+          setMessages((prev) => prev.map((m) => (m.id === message.id ? previousSnapshot : m)));
+          void saveCachedMessages(acctEmail, [previousSnapshot]);
+
+          if (res.status === 401 || data.code === 'TOKEN_EXPIRED') {
+            invalidateGmailAccessToken();
+            setNeedsGmailReconnect(true);
+          }
+          if (res.status === 403 || data.code === 'INSUFFICIENT_SCOPE') {
+            setNeedsMailActionScopeReauth(true);
+          }
+          setWorkspaceError(
+            data.error || 'Could not move email to Trash. Click Re-authorize Gmail and try again.'
+          );
+          return;
+        }
+
+        if (Array.isArray(data.labelIds)) {
+          const syncedTrashed: MailMessage = {
+            ...trashedMsg,
+            labelIds: Array.from(new Set([...data.labelIds, 'TRASH'])),
+          };
+          setMessages((prev) => prev.map((m) => (m.id === message.id ? syncedTrashed : m)));
+          void saveCachedMessages(acctEmail, [syncedTrashed]);
+        }
+
+        showToast('Moved to Trash');
+      } catch {
+        setMessages((prev) => prev.map((m) => (m.id === message.id ? previousSnapshot : m)));
+        void saveCachedMessages(acctEmail, [previousSnapshot]);
+        setWorkspaceError('Could not move email to Trash right now. Please try again.');
+      } finally {
+        setBusyActionMessageId((curr) => (curr === message.id ? null : curr));
+      }
+    },
+    [ensureMailActionToken, showToast]
+  );
+
+  /**
+   * Restores an email from Trash optimistically in UI + IndexedDB back to its original mailbox
+   * and calls Gmail messages.untrash.
+   */
+  const handleRestoreMessage = useCallback(
+    async (message: MailMessage) => {
+      const acctEmail = accountRef.current?.email;
+      if (!acctEmail) return;
+
+      setWorkspaceError(null);
+
+      let token = getGmailAccessToken(acctEmail);
+      if (!token || !hasFullMailActionScopes(acctEmail)) {
+        try {
+          token = await ensureMailActionToken(true);
+        } catch (authErr) {
+          setNeedsMailActionScopeReauth(true);
+          setWorkspaceError(
+            authErr instanceof Error
+              ? authErr.message
+              : 'Re-authorize Google to restore emails from Trash.'
+          );
+          return;
+        }
+      }
+
+      if (!token) {
+        setNeedsMailActionScopeReauth(true);
+        setWorkspaceError('Re-authorize Gmail to restore emails.');
+        return;
+      }
+
+      const previousSnapshot = message;
+      const restoredLabels = Array.from(
+        new Set([...(message.labelIds || []).filter((l) => l !== 'TRASH'), 'INBOX'])
+      );
+      const restoredMsg: MailMessage = {
+        ...message,
+        labelIds: restoredLabels,
+      };
+
+      setBusyActionMessageId(message.id);
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? restoredMsg : m)));
+      void saveCachedMessages(acctEmail, [restoredMsg]);
+
+      try {
+        const res = await fetch(`/api/gmail/messages/${encodeURIComponent(message.id)}/untrash`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          code?: string;
+          error?: string;
+          labelIds?: string[];
+        };
+
+        if (!res.ok) {
+          setMessages((prev) => prev.map((m) => (m.id === message.id ? previousSnapshot : m)));
+          void saveCachedMessages(acctEmail, [previousSnapshot]);
+
+          if (res.status === 401 || data.code === 'TOKEN_EXPIRED') {
+            invalidateGmailAccessToken();
+            setNeedsGmailReconnect(true);
+          }
+          if (res.status === 403 || data.code === 'INSUFFICIENT_SCOPE') {
+            setNeedsMailActionScopeReauth(true);
+          }
+          setWorkspaceError(
+            data.error || 'Could not restore email from Trash. Click Re-authorize Gmail and retry.'
+          );
+          return;
+        }
+
+        if (Array.isArray(data.labelIds)) {
+          const syncedRestored: MailMessage = {
+            ...restoredMsg,
+            labelIds: data.labelIds.filter((l) => l !== 'TRASH'),
+          };
+          setMessages((prev) => prev.map((m) => (m.id === message.id ? syncedRestored : m)));
+          void saveCachedMessages(acctEmail, [syncedRestored]);
+        }
+
+        showToast('Restored from Trash');
+      } catch {
+        setMessages((prev) => prev.map((m) => (m.id === message.id ? previousSnapshot : m)));
+        void saveCachedMessages(acctEmail, [previousSnapshot]);
+        setWorkspaceError('Could not restore email right now. Please try again.');
+      } finally {
+        setBusyActionMessageId((curr) => (curr === message.id ? null : curr));
+      }
+    },
+    [ensureMailActionToken, showToast]
+  );
+
+  /**
+   * Permanently deletes a single message from Gmail (messages.delete) and IndexedDB.
+   */
+  const handleDeleteForeverMessage = useCallback(
+    async (message: MailMessage) => {
+      const acctEmail = accountRef.current?.email;
+      if (!acctEmail) return;
+
+      setWorkspaceError(null);
+
+      let token = getGmailAccessToken(acctEmail);
+      if (!token || !hasFullMailActionScopes(acctEmail)) {
+        try {
+          token = await ensureMailActionToken(true);
+        } catch (authErr) {
+          setNeedsMailActionScopeReauth(true);
+          setWorkspaceError(
+            authErr instanceof Error
+              ? authErr.message
+              : 'Re-authorize Google to permanently delete emails.'
+          );
+          return;
+        }
+      }
+
+      if (!token) {
+        setNeedsMailActionScopeReauth(true);
+        setWorkspaceError('Re-authorize Gmail to delete messages permanently.');
+        return;
+      }
+
+      setBusyActionMessageId(message.id);
+      try {
+        const res = await fetch(`/api/gmail/messages/${encodeURIComponent(message.id)}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          code?: string;
+          error?: string;
+        };
+
+        if (!res.ok) {
+          if (res.status === 401 || data.code === 'TOKEN_EXPIRED') {
+            invalidateGmailAccessToken();
+            setNeedsGmailReconnect(true);
+          }
+          if (res.status === 403 || data.code === 'INSUFFICIENT_SCOPE') {
+            setNeedsMailActionScopeReauth(true);
+          }
+          setWorkspaceError(
+            data.error ||
+              'Permanent deletion requires full Gmail permission. Click Re-authorize Gmail and try again.'
+          );
+          return;
+        }
+
+        setMessages((prev) => prev.filter((m) => m.id !== message.id));
+        await deleteCachedMessages(acctEmail, [message.id]);
+        showToast('Deleted permanently');
+      } catch {
+        setWorkspaceError('Could not permanently delete this email right now.');
+      } finally {
+        setBusyActionMessageId((curr) => (curr === message.id ? null : curr));
+      }
+    },
+    [ensureMailActionToken, showToast]
+  );
+
+  /**
+   * Permanently empties all messages currently in Trash (Gmail batchDelete + IndexedDB cleanup).
+   */
+  const handleEmptyTrash = useCallback(async () => {
+    const acctEmail = accountRef.current?.email;
+    if (!acctEmail) return;
+
+    const trashedIds = messagesRef.current
+      .filter((m) => m.labelIds?.includes('TRASH'))
+      .map((m) => m.id);
+    if (trashedIds.length === 0) return;
+
+    setWorkspaceError(null);
+
+    let token = getGmailAccessToken(acctEmail);
+    if (!token || !hasFullMailActionScopes(acctEmail)) {
+      try {
+        token = await ensureMailActionToken(true);
+      } catch (authErr) {
+        setNeedsMailActionScopeReauth(true);
+        setWorkspaceError(
+          authErr instanceof Error ? authErr.message : 'Re-authorize Google to empty Trash.'
+        );
+        return;
+      }
+    }
+
+    if (!token) {
+      setNeedsMailActionScopeReauth(true);
+      setWorkspaceError('Re-authorize Gmail to empty Trash.');
+      return;
+    }
+
+    setIsEmptyingTrash(true);
+    try {
+      const res = await fetch('/api/gmail/trash/empty', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ messageIds: trashedIds }),
+      });
+
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        code?: string;
+        error?: string;
+      };
+
+      if (!res.ok) {
+        if (res.status === 401 || data.code === 'TOKEN_EXPIRED') {
+          invalidateGmailAccessToken();
+          setNeedsGmailReconnect(true);
+        }
+        if (res.status === 403 || data.code === 'INSUFFICIENT_SCOPE') {
+          setNeedsMailActionScopeReauth(true);
+        }
+        setWorkspaceError(
+          data.error ||
+            'Emptying Trash requires full Gmail permission. Click Re-authorize Gmail and try again.'
+        );
+        return;
+      }
+
+      const idSet = new Set(trashedIds);
+      setMessages((prev) => prev.filter((m) => !idSet.has(m.id)));
+      await deleteCachedMessages(acctEmail, trashedIds);
+      showToast('Trash emptied');
+    } catch {
+      setWorkspaceError('Could not empty Trash right now. Please try again.');
+    } finally {
+      setIsEmptyingTrash(false);
+    }
+  }, [ensureMailActionToken, showToast]);
+
+  /**
    * On-demand full email body loader: fetches format=full ONLY when clicked,
    * saves the full HTML body + attachments to IndexedDB, and NEVER overwrites an already-saved category.
    */
@@ -986,7 +1506,6 @@ export default function App() {
 
         if (acctEmail) {
           await saveCachedMessages(acctEmail, [hydrated]);
-          // Only classify if this messageId does NOT yet have a saved category in IndexedDB
           if (!hydrated.classification?.categoryId) {
             await classifyMessages([hydrated], rulesRef.current, feedbackRef.current, {
               accountEmail: acctEmail,
@@ -1065,14 +1584,12 @@ export default function App() {
     void hydrateRef.current(persisted.account).then(() => {
       const validToken = getGmailAccessToken(persisted.account.email);
       if (validToken) {
-        // Non-blocking background check for ONLY new emails arrived since latest cached timestamp
         void syncRef.current(persisted.account, {
           tokenOverride: validToken,
           hydrateCacheFirst: false,
           interactiveAuth: false,
         });
       } else {
-        // Token expired after 1 hour: keep cached inbox open and show subtle reconnect banner
         setNeedsGmailReconnect(true);
       }
     });
@@ -1101,8 +1618,8 @@ export default function App() {
           return nextAccount;
         });
         setNeedsGmailReconnect(false);
+        setNeedsMailActionScopeReauth(!hasFullMailActionScopes(nextAccount.email));
         setAuthError(null);
-        // Only trigger sync if not already hydrated and synced on mount
         if (hydratedAccountRef.current !== nextAccount.email.toLowerCase()) {
           void syncRef.current(nextAccount, {
             tokenOverride: token,
@@ -1112,7 +1629,6 @@ export default function App() {
         }
       },
       () => {
-        // Only clear account if there is no persisted "Keep me signed in" session
         const persisted = loadPersistedSession(allowedDomainsRef.current);
         if (!persisted) {
           setAccount((prev) => (prev?.provider === 'gmail' ? null : prev));
@@ -1120,8 +1636,6 @@ export default function App() {
       },
       allowedDomainsRef.current,
       (restoredUser) => {
-        // Firebase restored a signed-in campus user whose 1h Gmail token expired:
-        // open their cached IndexedDB inbox immediately and show subtle reconnect banner
         const email = restoredUser.email || '';
         if (!email || !isAllowedCampusEmail(email, allowedDomainsRef.current)) {
           setAccount(null);
@@ -1133,10 +1647,9 @@ export default function App() {
           displayName: restoredUser.displayName || email,
           photoUrl: restoredUser.photoURL || undefined,
         };
-        setAccount((prev) =>
-          prev?.email === restoredAccount.email ? prev : restoredAccount
-        );
+        setAccount((prev) => (prev?.email === restoredAccount.email ? prev : restoredAccount));
         setNeedsGmailReconnect(true);
+        setNeedsMailActionScopeReauth(true);
         if (hydratedAccountRef.current !== email.toLowerCase()) {
           void hydrateRef.current(restoredAccount);
         }
@@ -1155,6 +1668,7 @@ export default function App() {
         savePersistedSession(connected, keepSignedInRef.current);
         setAccount(connected);
         setNeedsGmailReconnect(false);
+        setNeedsMailActionScopeReauth(false);
         setAuthError(null);
         void syncRef.current(connected, {
           tokenOverride: result.accessToken,
@@ -1171,7 +1685,10 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  const handleGoogleLogin = async (forceConsent = false, keepSignedInChoice = true) => {
+  const handleGoogleLogin = async (
+    forceConsent = false,
+    keepSignedInChoice = true
+  ): Promise<boolean> => {
     setKeepSignedIn(keepSignedInChoice);
     setIsLoggingIn(true);
     setAuthError(null);
@@ -1183,7 +1700,7 @@ export default function App() {
         keepSignedInChoice,
         accountRef.current?.email
       );
-      if (!result) return;
+      if (!result) return false;
 
       const connected: ConnectedAccount = {
         provider: 'gmail',
@@ -1193,11 +1710,13 @@ export default function App() {
       };
       setAccount(connected);
       setNeedsGmailReconnect(false);
+      setNeedsMailActionScopeReauth(false);
       await syncInbox(connected, {
         tokenOverride: result.accessToken,
         hydrateCacheFirst: true,
         interactiveAuth: true,
       });
+      return true;
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'College Google sign-in was cancelled or failed.';
@@ -1206,6 +1725,7 @@ export default function App() {
       } else {
         setAuthError(message);
       }
+      return false;
     } finally {
       setIsLoggingIn(false);
     }
@@ -1231,9 +1751,11 @@ export default function App() {
     }
     setAccount(null);
     setNeedsGmailReconnect(false);
+    setNeedsMailActionScopeReauth(false);
     setMessages([]);
     setWorkspaceError(null);
     setStatusMessage(null);
+    setToastMessage(null);
     setSyncProgress({
       isRunning: false,
       fetchedCount: 0,
@@ -1333,7 +1855,9 @@ export default function App() {
       <AuthLanding
         isLoggingIn={isLoggingIn}
         authError={authError}
-        onGoogleLogin={handleGoogleLogin}
+        onGoogleLogin={(forceConsent, keepChoice) => {
+          void handleGoogleLogin(forceConsent, keepChoice);
+        }}
       />
     );
   }
@@ -1349,9 +1873,14 @@ export default function App() {
       syncProgress={syncProgress}
       loadingFullMessageId={loadingFullMessageId}
       reclassifyingMessageId={reclassifyingMessageId}
+      busyActionMessageId={busyActionMessageId}
+      isEmptyingTrash={isEmptyingTrash}
       needsGmailReconnect={needsGmailReconnect}
+      needsMailActionScopeReauth={needsMailActionScopeReauth}
       statusMessage={statusMessage}
       errorMessage={workspaceError}
+      toastMessage={toastMessage}
+      onDismissToast={() => setToastMessage(null)}
       onSyncInbox={() => syncInbox(account, { interactiveAuth: true })}
       onStopSync={handleStopSync}
       onLoadOlderMail={() => syncInbox(account, { loadOlderOnly: true, interactiveAuth: true })}
@@ -1363,6 +1892,11 @@ export default function App() {
       onEnsureFullMessage={handleEnsureFullMessage}
       onManualReclassifyMessage={handleManualReclassifyMessage}
       onManualMoveMessage={handleManualMoveMessage}
+      onSendEmail={handleSendEmail}
+      onTrashMessage={handleTrashMessage}
+      onRestoreMessage={handleRestoreMessage}
+      onDeleteForeverMessage={handleDeleteForeverMessage}
+      onEmptyTrash={handleEmptyTrash}
     />
   );
 }

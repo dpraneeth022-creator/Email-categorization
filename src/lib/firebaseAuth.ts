@@ -19,8 +19,14 @@ import {
 } from '../shared/campusPolicy';
 import type { ConnectedAccount } from '../shared/types';
 
-export const GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
+export const GMAIL_SCOPES = [
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/gmail.modify',
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://mail.google.com/',
+];
 
+const REQUIRED_SCOPE_VERSION = 2;
 const PERSISTED_SESSION_KEY = 'nexamail_persisted_session_v1';
 const PERSISTED_TOKEN_KEY = 'nexamail_gmail_token_v1';
 const DEFAULT_TOKEN_TTL_MS = 55 * 60 * 1000; // 55 minutes conservative default for 1h Google OAuth token
@@ -36,6 +42,7 @@ interface PersistedGmailToken {
   email: string;
   accessToken: string;
   expiresAt: number;
+  scopeVersion?: number;
 }
 
 // Supports optional VITE_FIREBASE_* env overrides when deploying under an @rvce.edu.in Workspace project
@@ -59,6 +66,7 @@ const auth = getAuth(app);
 let isSigningIn = false;
 let cachedAccessToken: string | null = null;
 let cachedTokenExpiresAt = 0;
+let cachedScopeVersion = 0;
 
 function safeLocalStorage(): Storage | null {
   try {
@@ -154,7 +162,8 @@ function storeGmailToken(
   email: string,
   accessToken: string,
   expiresInSeconds?: number,
-  persistInLocalStorage = true
+  persistInLocalStorage = true,
+  scopeVersion = REQUIRED_SCOPE_VERSION
 ): number {
   const ttlMs =
     expiresInSeconds && Number.isFinite(expiresInSeconds) && expiresInSeconds > 60
@@ -164,6 +173,7 @@ function storeGmailToken(
 
   cachedAccessToken = accessToken;
   cachedTokenExpiresAt = expiresAt;
+  cachedScopeVersion = scopeVersion;
 
   const storage = safeLocalStorage();
   if (storage) {
@@ -173,6 +183,7 @@ function storeGmailToken(
           email: email.trim().toLowerCase(),
           accessToken,
           expiresAt,
+          scopeVersion,
         };
         storage.setItem(PERSISTED_TOKEN_KEY, JSON.stringify(record));
       } else {
@@ -211,6 +222,7 @@ export function getGmailAccessToken(expectedEmail?: string): string | null {
         ) {
           cachedAccessToken = parsed.accessToken;
           cachedTokenExpiresAt = parsed.expiresAt;
+          cachedScopeVersion = Number(parsed.scopeVersion) || 1;
           return cachedAccessToken;
         }
       }
@@ -221,6 +233,7 @@ export function getGmailAccessToken(expectedEmail?: string): string | null {
 
   cachedAccessToken = null;
   cachedTokenExpiresAt = 0;
+  cachedScopeVersion = 0;
   return null;
 }
 
@@ -229,11 +242,20 @@ export function isGmailTokenExpired(expectedEmail?: string): boolean {
 }
 
 /**
+ * Returns true if the current active Gmail session includes send + modify/trash/delete scopes.
+ */
+export function hasFullMailActionScopes(expectedEmail?: string): boolean {
+  const token = getGmailAccessToken(expectedEmail);
+  return Boolean(token && cachedScopeVersion >= REQUIRED_SCOPE_VERSION);
+}
+
+/**
  * Clears ONLY the expired/revoked Gmail OAuth token without signing the user out or clearing cached mail.
  */
 export function invalidateGmailAccessToken(): void {
   cachedAccessToken = null;
   cachedTokenExpiresAt = 0;
+  cachedScopeVersion = 0;
   const storage = safeLocalStorage();
   if (storage) {
     try {

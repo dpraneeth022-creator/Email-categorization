@@ -148,7 +148,7 @@ function sanitizeGmailApiError(
       status: 403,
       code: 'INSUFFICIENT_SCOPE',
       error:
-        'Gmail read permission was not granted during Google sign-in. Click Re-authorize Gmail and allow Gmail access.',
+        'Additional Gmail permissions are required for this action. Click Re-authorize Gmail and allow access.',
     };
   }
 
@@ -705,6 +705,7 @@ async function createServer() {
       query: string;
       pageToken: string;
       excludeIds: Set<string>;
+      labelId?: string;
     }
   ) => {
     try {
@@ -728,7 +729,14 @@ async function createServer() {
         maxResults: String(params.maxResults),
         includeSpamTrash: 'true',
       });
-      listParams.set('q', params.query || '-in:trash');
+      if (params.labelId) {
+        listParams.set('labelIds', params.labelId);
+        if (params.query) {
+          listParams.set('q', params.query);
+        }
+      } else {
+        listParams.set('q', params.query || '-in:trash');
+      }
       if (params.pageToken) {
         listParams.set('pageToken', params.pageToken);
       }
@@ -902,7 +910,7 @@ async function createServer() {
     }
   };
 
-  // Primary metadata-first incremental sync endpoint (supports afterTimestamp + large excludeIds arrays cleanly)
+  // Primary metadata-first incremental sync endpoint (supports afterTimestamp, labelId e.g. TRASH, and large excludeIds arrays)
   app.post('/api/gmail/sync', async (req, res) => {
     const body = (req.body || {}) as {
       maxResults?: number;
@@ -910,9 +918,14 @@ async function createServer() {
       pageToken?: string;
       excludeIds?: string[];
       afterTimestamp?: number;
+      labelId?: string;
     };
     const maxResults = Math.min(100, Math.max(5, Number(body.maxResults) || 60));
     const rawQuery = typeof body.q === 'string' ? body.q.trim() : '';
+    const labelId =
+      typeof body.labelId === 'string' && /^[A-Z0-9_]+$/.test(body.labelId.trim())
+        ? body.labelId.trim()
+        : undefined;
     const afterTs =
       typeof body.afterTimestamp === 'number' &&
       Number.isFinite(body.afterTimestamp) &&
@@ -921,6 +934,10 @@ async function createServer() {
         : null;
     const query = rawQuery
       ? rawQuery
+      : labelId
+      ? afterTs
+        ? `after:${afterTs}`
+        : ''
       : afterTs
       ? `-in:trash after:${afterTs}`
       : '-in:trash';
@@ -930,7 +947,7 @@ async function createServer() {
         ? body.excludeIds.filter((id): id is string => typeof id === 'string')
         : []
     );
-    await handleGmailMetadataSync(req, res, { maxResults, query, pageToken, excludeIds });
+    await handleGmailMetadataSync(req, res, { maxResults, query, pageToken, excludeIds, labelId });
   });
 
   // Backwards-compatible GET route delegating to the same metadata-first paced handler
@@ -1075,6 +1092,278 @@ async function createServer() {
       res.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to download attachment.',
       });
+    }
+  });
+
+  // Compose & Send email via Gmail API (base64url RFC 2822 MIME message)
+  app.post('/api/gmail/send', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({ code: 'TOKEN_EXPIRED', error: 'Missing Gmail access token.' });
+        return;
+      }
+
+      const campusCheck = await verifyCampusGmailToken(authHeader);
+      if (!campusCheck.ok) {
+        res.status(campusCheck.status).json({
+          code: campusCheck.code,
+          error: campusCheck.error,
+        });
+        return;
+      }
+
+      const body = (req.body || {}) as {
+        to?: string;
+        cc?: string;
+        bcc?: string;
+        subject?: string;
+        body?: string;
+      };
+
+      const sanitizeHeader = (val?: string) => (val || '').replace(/[\r\n]+/g, ' ').trim();
+
+      const to = sanitizeHeader(body.to);
+      const cc = sanitizeHeader(body.cc);
+      const bcc = sanitizeHeader(body.bcc);
+      const subject = sanitizeHeader(body.subject);
+      const textBody = typeof body.body === 'string' ? body.body : '';
+
+      if (!to) {
+        res.status(400).json({ error: 'Recipient (To) address is required.' });
+        return;
+      }
+
+      const encodedSubject = /[^\x20-\x7E]/.test(subject)
+        ? `=?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`
+        : subject;
+
+      const mimeHeaders: string[] = [`From: ${campusCheck.email}`, `To: ${to}`];
+      if (cc) mimeHeaders.push(`Cc: ${cc}`);
+      if (bcc) mimeHeaders.push(`Bcc: ${bcc}`);
+      mimeHeaders.push(
+        `Subject: ${encodedSubject}`,
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset="UTF-8"',
+        'Content-Transfer-Encoding: base64'
+      );
+
+      const bodyBase64 = Buffer.from(textBody, 'utf8').toString('base64');
+      const rfc2822 = `${mimeHeaders.join('\r\n')}\r\n\r\n${bodyBase64}`;
+      const rawBase64Url = Buffer.from(rfc2822, 'utf8')
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/g, '');
+
+      const sendRes = await fetch(
+        'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: authHeader,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ raw: rawBase64Url }),
+        }
+      );
+
+      const sendBody = await sendRes.text();
+      if (!sendRes.ok) {
+        const friendly = sanitizeGmailApiError(sendRes.status, sendBody);
+        res.status(friendly.status).json({
+          code: friendly.code,
+          error: friendly.error,
+        });
+        return;
+      }
+
+      const sentData = JSON.parse(sendBody) as {
+        id?: string;
+        threadId?: string;
+        labelIds?: string[];
+      };
+      res.json({
+        ok: true,
+        id: sentData.id,
+        threadId: sentData.threadId,
+        labelIds: sentData.labelIds,
+      });
+    } catch (error) {
+      console.error('Gmail send route error:', error);
+      res.status(500).json({ error: 'Unable to send email right now. Please try again.' });
+    }
+  });
+
+  // Move email to Gmail Trash (messages.trash)
+  app.post('/api/gmail/messages/:messageId/trash', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({ code: 'TOKEN_EXPIRED', error: 'Missing Gmail access token.' });
+        return;
+      }
+
+      const campusCheck = await verifyCampusGmailToken(authHeader);
+      if (!campusCheck.ok) {
+        res.status(campusCheck.status).json({ code: campusCheck.code, error: campusCheck.error });
+        return;
+      }
+
+      const { messageId } = req.params;
+      const trashRes = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
+          messageId
+        )}/trash`,
+        {
+          method: 'POST',
+          headers: { Authorization: authHeader },
+        }
+      );
+      const trashBody = await trashRes.text();
+      if (!trashRes.ok) {
+        const friendly = sanitizeGmailApiError(trashRes.status, trashBody);
+        res.status(friendly.status).json({ code: friendly.code, error: friendly.error });
+        return;
+      }
+
+      const data = JSON.parse(trashBody) as { id?: string; labelIds?: string[] };
+      res.json({ ok: true, id: data.id || messageId, labelIds: data.labelIds });
+    } catch (error) {
+      console.error('Gmail trash route error:', error);
+      res.status(500).json({ error: 'Unable to move message to Trash right now.' });
+    }
+  });
+
+  // Restore email from Gmail Trash (messages.untrash)
+  app.post('/api/gmail/messages/:messageId/untrash', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({ code: 'TOKEN_EXPIRED', error: 'Missing Gmail access token.' });
+        return;
+      }
+
+      const campusCheck = await verifyCampusGmailToken(authHeader);
+      if (!campusCheck.ok) {
+        res.status(campusCheck.status).json({ code: campusCheck.code, error: campusCheck.error });
+        return;
+      }
+
+      const { messageId } = req.params;
+      const untrashRes = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
+          messageId
+        )}/untrash`,
+        {
+          method: 'POST',
+          headers: { Authorization: authHeader },
+        }
+      );
+      const untrashBody = await untrashRes.text();
+      if (!untrashRes.ok) {
+        const friendly = sanitizeGmailApiError(untrashRes.status, untrashBody);
+        res.status(friendly.status).json({ code: friendly.code, error: friendly.error });
+        return;
+      }
+
+      const data = JSON.parse(untrashBody) as { id?: string; labelIds?: string[] };
+      res.json({ ok: true, id: data.id || messageId, labelIds: data.labelIds });
+    } catch (error) {
+      console.error('Gmail untrash route error:', error);
+      res.status(500).json({ error: 'Unable to restore message from Trash right now.' });
+    }
+  });
+
+  // Permanently delete email from Gmail (messages.delete)
+  app.delete('/api/gmail/messages/:messageId', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({ code: 'TOKEN_EXPIRED', error: 'Missing Gmail access token.' });
+        return;
+      }
+
+      const campusCheck = await verifyCampusGmailToken(authHeader);
+      if (!campusCheck.ok) {
+        res.status(campusCheck.status).json({ code: campusCheck.code, error: campusCheck.error });
+        return;
+      }
+
+      const { messageId } = req.params;
+      const delRes = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}`,
+        {
+          method: 'DELETE',
+          headers: { Authorization: authHeader },
+        }
+      );
+      const delBody = await delRes.text();
+      if (!delRes.ok) {
+        const friendly = sanitizeGmailApiError(delRes.status, delBody);
+        res.status(friendly.status).json({ code: friendly.code, error: friendly.error });
+        return;
+      }
+
+      res.json({ ok: true, id: messageId });
+    } catch (error) {
+      console.error('Gmail permanent delete route error:', error);
+      res.status(500).json({ error: 'Unable to permanently delete this message right now.' });
+    }
+  });
+
+  // Empty Trash (batch permanently delete messages in Trash)
+  app.post('/api/gmail/trash/empty', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({ code: 'TOKEN_EXPIRED', error: 'Missing Gmail access token.' });
+        return;
+      }
+
+      const campusCheck = await verifyCampusGmailToken(authHeader);
+      if (!campusCheck.ok) {
+        res.status(campusCheck.status).json({ code: campusCheck.code, error: campusCheck.error });
+        return;
+      }
+
+      const body = (req.body || {}) as { messageIds?: string[] };
+      const ids = Array.isArray(body.messageIds)
+        ? body.messageIds.filter(
+            (id): id is string => typeof id === 'string' && id.trim().length > 0
+          )
+        : [];
+
+      if (ids.length === 0) {
+        res.json({ ok: true, deletedCount: 0 });
+        return;
+      }
+
+      for (let i = 0; i < ids.length; i += 500) {
+        const chunk = ids.slice(i, i + 500);
+        const batchRes = await fetch(
+          'https://gmail.googleapis.com/gmail/v1/users/me/messages/batchDelete',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: authHeader,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ ids: chunk }),
+          }
+        );
+        const batchBody = await batchRes.text();
+        if (!batchRes.ok) {
+          const friendly = sanitizeGmailApiError(batchRes.status, batchBody);
+          res.status(friendly.status).json({ code: friendly.code, error: friendly.error });
+          return;
+        }
+      }
+
+      res.json({ ok: true, deletedCount: ids.length });
+    } catch (error) {
+      console.error('Gmail empty trash route error:', error);
+      res.status(500).json({ error: 'Unable to empty Trash right now.' });
     }
   });
 
