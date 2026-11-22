@@ -88,7 +88,8 @@ export function formatFirebaseAuthError(error: unknown): string {
 export const initGoogleAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
   onAuthFailure?: () => void,
-  allowedDomains: readonly string[] = DEFAULT_ALLOWED_CAMPUS_DOMAINS
+  allowedDomains: readonly string[] = DEFAULT_ALLOWED_CAMPUS_DOMAINS,
+  onCachedUserSession?: (user: User) => void
 ) => {
   return onAuthStateChanged(auth, (user: User | null) => {
     if (user) {
@@ -105,7 +106,11 @@ export const initGoogleAuth = (
         onAuthSuccess?.(user, cachedAccessToken);
       } else if (!isSigningIn) {
         cachedAccessToken = null;
-        onAuthFailure?.();
+        if (onCachedUserSession) {
+          onCachedUserSession(user);
+        } else {
+          onAuthFailure?.();
+        }
       }
     } else {
       cachedAccessToken = null;

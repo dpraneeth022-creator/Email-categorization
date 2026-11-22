@@ -7,14 +7,13 @@ import {
   Mail,
   Menu,
   Paperclip,
-  Plus,
   RefreshCw,
   Search,
   Share2,
-  SlidersHorizontal,
   X,
 } from 'lucide-react';
 import type { SyncProgressState } from '../App';
+import { decodeHtmlEntities } from '../shared/classifierRules';
 import type {
   ClassificationRule,
   ConnectedAccount,
@@ -30,23 +29,17 @@ interface MailWorkspaceProps {
   messages: MailMessage[];
   rules: ClassificationRule[];
   isFetchingMail: boolean;
+  isLoadingOlder: boolean;
   isClassifying: boolean;
   syncProgress: SyncProgressState;
   loadingFullMessageId: string | null;
+  statusMessage: string | null;
   errorMessage: string | null;
-  onSyncMail: () => void;
+  onSyncInbox: () => void;
   onStopSync: () => void;
-  onResumeSync: () => void;
-  onSyncRvceMail?: () => void;
-  onRunClassify: () => void;
+  onLoadOlderMail: () => void;
   onReauthorizeGmail?: () => void;
   onSignOut: () => void;
-  onOpenTraining: (tab?: 'rules' | 'order' | 'test') => void;
-  onReassignMessage: (
-    message: MailMessage,
-    newCategoryId: string,
-    addSenderToDirectory: boolean
-  ) => void;
   onToggleReadState: (messageId: string, unread: boolean) => void;
   onDownloadAttachment: (message: MailMessage, attachment: MailAttachment) => Promise<void>;
   onEnsureFullMessage: (message: MailMessage) => void;
@@ -90,19 +83,17 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   messages,
   rules,
   isFetchingMail,
+  isLoadingOlder,
   isClassifying,
   syncProgress,
   loadingFullMessageId,
+  statusMessage,
   errorMessage,
-  onSyncMail,
+  onSyncInbox,
   onStopSync,
-  onResumeSync,
-  onSyncRvceMail,
-  onRunClassify,
+  onLoadOlderMail,
   onReauthorizeGmail,
   onSignOut,
-  onOpenTraining,
-  onReassignMessage,
   onToggleReadState,
   onDownloadAttachment,
   onEnsureFullMessage,
@@ -217,7 +208,7 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
     setMobileMenuOpen(false);
   };
 
-  // Automatically hydrate full HTML body & attachments whenever an email is selected/opened
+  // Automatically hydrate full HTML body & attachments on demand when an email is clicked/opened
   useEffect(() => {
     if (selectedMessage && selectedMessage.fullBodyLoaded === false) {
       onEnsureFullMessage(selectedMessage);
@@ -227,11 +218,6 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
   const visibleMessages = useMemo(
     () => filteredMessages.slice(0, visibleListCount),
     [filteredMessages, visibleListCount]
-  );
-
-  const classifiedTotal = useMemo(
-    () => messages.filter((m) => Boolean(m.classification)).length,
-    [messages]
   );
 
   // Keyboard shortcuts: Escape closes expanded/mobile reader, Up/Down navigates emails
@@ -279,6 +265,8 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
     return <Mail className="w-4 h-4 text-blue-700 shrink-0" />;
   };
 
+  const isSyncBusy = isFetchingMail || isClassifying;
+
   const sidebarContent = (
     <div className="flex flex-col h-full bg-white border-r border-slate-200 w-64 shrink-0">
       {/* Brand Header */}
@@ -312,105 +300,72 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
         </div>
       </div>
 
-      {/* Mailboxes List */}
-      <nav className="flex-1 overflow-y-auto mail-scroll px-3 py-4 space-y-6">
-        <div className="space-y-1">
-          <div className="px-2.5 pb-1.5 text-[11px] font-semibold text-slate-500">
-            Mailboxes
-          </div>
+      {/* Mailboxes List Only */}
+      <nav className="flex-1 overflow-y-auto mail-scroll px-3 py-4 space-y-1">
+        <div className="px-2.5 pb-1.5 text-[11px] font-semibold text-slate-500">Mailboxes</div>
 
-          <button
-            type="button"
-            onClick={() => handleSwitchFolder('all')}
-            className={`w-full px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 text-sm transition-colors cursor-pointer ${
-              activeFolder === 'all'
-                ? 'bg-slate-100 text-slate-950 font-semibold'
-                : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950 font-medium'
-            }`}
-          >
-            <span className="flex items-center gap-2.5 truncate">
-              <Inbox className="w-4 h-4 text-slate-500 shrink-0" />
-              <span className="truncate">All Mail</span>
-            </span>
-            <span className="font-mono tabular-nums text-xs text-slate-500">
-              {folderCounts.all || 0}
-            </span>
-          </button>
+        <button
+          type="button"
+          onClick={() => handleSwitchFolder('all')}
+          className={`w-full px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 text-sm transition-colors cursor-pointer ${
+            activeFolder === 'all'
+              ? 'bg-slate-100 text-slate-950 font-semibold'
+              : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950 font-medium'
+          }`}
+        >
+          <span className="flex items-center gap-2.5 truncate">
+            <Inbox className="w-4 h-4 text-slate-500 shrink-0" />
+            <span className="truncate">All Mail</span>
+          </span>
+          <span className="font-mono tabular-nums text-xs text-slate-500">
+            {folderCounts.all || 0}
+          </span>
+        </button>
 
-          {rules.map((rule) => {
-            const active = activeFolder === rule.id;
-            return (
-              <button
-                key={rule.id}
-                type="button"
-                onClick={() => handleSwitchFolder(rule.id)}
-                className={`w-full px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 text-sm transition-colors cursor-pointer ${
-                  active
-                    ? 'bg-slate-100 text-slate-950 font-semibold'
-                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950 font-medium'
-                }`}
-              >
-                <span className="flex items-center gap-2.5 min-w-0">
-                  <span
-                    className={`w-2 h-2 rounded-[2px] shrink-0 ${ACCENT_DOT_CLASS[rule.accent]}`}
-                    aria-hidden="true"
-                  />
-                  <span className="truncate">{rule.name}</span>
-                </span>
-                <span className="font-mono tabular-nums text-xs text-slate-500 shrink-0">
-                  {folderCounts[rule.id] || 0}
-                </span>
-              </button>
-            );
-          })}
+        {rules.map((rule) => {
+          const active = activeFolder === rule.id;
+          return (
+            <button
+              key={rule.id}
+              type="button"
+              onClick={() => handleSwitchFolder(rule.id)}
+              className={`w-full px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 text-sm transition-colors cursor-pointer ${
+                active
+                  ? 'bg-slate-100 text-slate-950 font-semibold'
+                  : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950 font-medium'
+              }`}
+            >
+              <span className="flex items-center gap-2.5 min-w-0">
+                <span
+                  className={`w-2 h-2 rounded-[2px] shrink-0 ${ACCENT_DOT_CLASS[rule.accent]}`}
+                  aria-hidden="true"
+                />
+                <span className="truncate">{rule.name}</span>
+              </span>
+              <span className="font-mono tabular-nums text-xs text-slate-500 shrink-0">
+                {folderCounts[rule.id] || 0}
+              </span>
+            </button>
+          );
+        })}
 
-          <button
-            type="button"
-            onClick={() => handleSwitchFolder('general')}
-            className={`w-full px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 text-sm transition-colors cursor-pointer ${
-              activeFolder === 'general'
-                ? 'bg-slate-100 text-slate-950 font-semibold'
-                : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950 font-medium'
-            }`}
-          >
-            <span className="flex items-center gap-2.5 truncate">
-              <Mail className="w-4 h-4 text-slate-400 shrink-0" />
-              <span className="truncate">General Inbox</span>
-            </span>
-            <span className="font-mono tabular-nums text-xs text-slate-500">
-              {folderCounts.general || 0}
-            </span>
-          </button>
-        </div>
-
-        {/* Classifier & Training Navigation */}
-        <div className="pt-4 border-t border-slate-200 space-y-1">
-          <div className="px-2.5 pb-1.5 text-[11px] font-semibold text-slate-500">
-            AI Classification
-          </div>
-          <button
-            type="button"
-            onClick={() => {
-              onOpenTraining('rules');
-              setMobileMenuOpen(false);
-            }}
-            className="w-full px-2.5 py-2 rounded-lg flex items-center gap-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-slate-950 transition-colors cursor-pointer"
-          >
-            <SlidersHorizontal className="w-4 h-4 text-slate-500 shrink-0" />
-            <span className="truncate">Rules &amp; Senders</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              onOpenTraining('order');
-              setMobileMenuOpen(false);
-            }}
-            className="w-full px-2.5 py-2 rounded-lg flex items-center gap-2.5 text-sm font-medium text-blue-700 hover:bg-blue-50/70 transition-colors cursor-pointer"
-          >
-            <Plus className="w-4 h-4 shrink-0" />
-            <span className="truncate">New Training Order</span>
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={() => handleSwitchFolder('general')}
+          className={`w-full px-2.5 py-2 rounded-lg flex items-center justify-between gap-2 text-sm transition-colors cursor-pointer ${
+            activeFolder === 'general'
+              ? 'bg-slate-100 text-slate-950 font-semibold'
+              : 'text-slate-600 hover:bg-slate-50 hover:text-slate-950 font-medium'
+          }`}
+        >
+          <span className="flex items-center gap-2.5 truncate">
+            <Mail className="w-4 h-4 text-slate-400 shrink-0" />
+            <span className="truncate">General Inbox</span>
+          </span>
+          <span className="font-mono tabular-nums text-xs text-slate-500">
+            {folderCounts.general || 0}
+          </span>
+        </button>
       </nav>
 
       {/* Share & Sign Out Footer */}
@@ -463,7 +418,7 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0 h-full">
-        {/* Contextual Workspace Header */}
+        {/* Clean Contextual Workspace Header — Single Sync Inbox Button */}
         <header className="h-14 bg-white border-b border-slate-200 px-4 lg:px-6 flex items-center justify-between gap-4 shrink-0">
           <div className="flex items-center gap-3 min-w-0">
             <button
@@ -476,7 +431,9 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
             </button>
             <div className="flex items-center gap-2 text-sm min-w-0">
               <span className="text-slate-500 hidden sm:inline">Inbox</span>
-              <span className="text-slate-300 hidden sm:inline" aria-hidden="true">/</span>
+              <span className="text-slate-300 hidden sm:inline" aria-hidden="true">
+                /
+              </span>
               <span className="font-semibold text-slate-950 truncate">{activeFolderLabel}</span>
             </div>
           </div>
@@ -495,98 +452,39 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {onSyncRvceMail && (
+            {syncProgress.isRunning && (
               <button
                 type="button"
-                onClick={onSyncRvceMail}
-                disabled={isFetchingMail}
-                className="h-9 px-3 text-xs font-medium text-blue-700 bg-blue-50/70 border border-blue-200 hover:bg-blue-100/70 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60"
-                title="Fetch all RVCE, MathWorks, NSS, NCC, and volunteering messages directly from Gmail"
+                onClick={onStopSync}
+                className="h-9 px-3 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
-                <span>Fetch RVCE Mails</span>
+                Pause
               </button>
             )}
-
             <button
               type="button"
-              onClick={onSyncMail}
-              disabled={isFetchingMail}
-              className="h-9 px-3.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 hover:border-slate-300 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isFetchingMail ? 'animate-spin' : ''}`} />
-              <span>{isFetchingMail ? 'Syncing...' : 'Sync All'}</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={onRunClassify}
-              disabled={isClassifying || messages.length === 0}
+              onClick={onSyncInbox}
+              disabled={isSyncBusy}
               className="h-9 px-3.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60"
             >
-              {isClassifying ? (
-                <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>Classifying...</span>
-                </>
-              ) : (
-                <span>Classify</span>
-              )}
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncBusy ? 'animate-spin' : ''}`} />
+              <span>{isSyncBusy ? 'Syncing...' : 'Sync Inbox'}</span>
             </button>
           </div>
         </header>
 
-        {/* Full-Mailbox Sync & Categorization Progress Strip */}
-        {(syncProgress.isRunning || (!syncProgress.isRunning && syncProgress.hasMore)) && (
-          <div className="px-4 lg:px-6 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs shrink-0">
-            <div className="flex items-center gap-2 text-slate-700 min-w-0">
-              {syncProgress.isRunning && (
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-700 shrink-0" />
-              )}
-              <span className="font-medium text-slate-900 truncate">
-                {syncProgress.isRunning
-                  ? syncProgress.phaseLabel || 'Syncing & categorizing all mail'
-                  : 'Mailbox sync paused'}
-              </span>
-              <span className="text-slate-300" aria-hidden="true">
-                ·
-              </span>
-              <span className="font-mono tabular-nums text-slate-600 whitespace-nowrap">
-                {messages.length.toLocaleString()} loaded
-                {syncProgress.totalEstimate && syncProgress.totalEstimate > messages.length
-                  ? ` of ~${syncProgress.totalEstimate.toLocaleString()}`
-                  : ''}
-              </span>
-              <span className="text-slate-300" aria-hidden="true">
-                ·
-              </span>
-              <span className="font-mono tabular-nums text-slate-600 whitespace-nowrap">
-                {classifiedTotal.toLocaleString()} categorized
-              </span>
-            </div>
-
-            <div className="flex items-center gap-2 shrink-0">
-              {syncProgress.isRunning ? (
-                <button
-                  type="button"
-                  onClick={onStopSync}
-                  className="px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-100 rounded-md whitespace-nowrap cursor-pointer transition-colors"
-                >
-                  Pause
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={onResumeSync}
-                  className="px-2.5 py-1 text-xs font-semibold text-blue-700 bg-white border border-blue-200 hover:bg-blue-50 rounded-md whitespace-nowrap cursor-pointer transition-colors"
-                >
-                  Continue Loading Older Mail
-                </button>
-              )}
-            </div>
+        {/* Friendly Rate-Limit / Sync Status Strip */}
+        {statusMessage && (
+          <div
+            role="status"
+            className="px-4 lg:px-6 py-2 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center gap-2 shrink-0"
+          >
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-700 shrink-0" />
+            <span>{statusMessage}</span>
           </div>
         )}
 
-        {/* Error Banner */}
+        {/* Friendly Error Banner (only for auth expiration / real failures) */}
         {errorMessage && (
           <div
             role="alert"
@@ -605,7 +503,7 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
               )}
               <button
                 type="button"
-                onClick={onSyncMail}
+                onClick={onSyncInbox}
                 className="font-semibold underline whitespace-nowrap cursor-pointer"
               >
                 Retry
@@ -616,7 +514,7 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
 
         {/* Responsive Split / Full-Screen Workspace: Mail List + Email Reader */}
         <div className="flex-1 flex min-h-0 overflow-hidden">
-          {/* Center Column: Mail List (hidden on mobile when reader is open, hidden on desktop when reader is expanded) */}
+          {/* Center Column: Mail List */}
           <section
             className={`${
               isMobileReaderOpen && selectedMessage ? 'hidden' : 'flex'
@@ -687,23 +585,16 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                   </p>
                   <p className="text-xs text-slate-500 leading-relaxed max-w-xs mx-auto">
                     {messages.length === 0
-                      ? 'Sync your mailbox to load recent messages and run automatic Gemini classification.'
-                      : 'No fetched messages currently match this mailbox or search filter.'}
+                      ? 'Sync your inbox to load recent messages and categorize them automatically.'
+                      : 'No messages currently match this mailbox or search filter.'}
                   </p>
-                  <div className="pt-2 flex items-center justify-center gap-2">
+                  <div className="pt-2 flex items-center justify-center">
                     <button
                       type="button"
-                      onClick={onSyncMail}
+                      onClick={onSyncInbox}
                       className="px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg cursor-pointer"
                     >
-                      Sync Mail
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onOpenTraining('test')}
-                      className="px-3.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
-                    >
-                      Test Classifier
+                      Sync Inbox
                     </button>
                   </div>
                 </div>
@@ -713,6 +604,9 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                     const isSelected = selectedMessage?.id === msg.id;
                     const matchedRule = getRuleById(msg.classification?.categoryId);
                     const attachmentCount = msg.attachments?.filter((a) => a.filename).length || 0;
+                    const cleanFrom = decodeHtmlEntities(msg.fromName || msg.fromEmail);
+                    const cleanSubject = decodeHtmlEntities(msg.subject || '(No Subject)');
+                    const cleanSnippet = decodeHtmlEntities(msg.snippet || '');
 
                     return (
                       <button
@@ -732,7 +626,7 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                                 : 'font-medium text-slate-800'
                             }`}
                           >
-                            {msg.fromName}
+                            {cleanFrom}
                           </span>
                           <span className="text-[11px] font-mono tabular-nums text-slate-500 shrink-0">
                             {formatShortDate(msg.dateIso)}
@@ -746,12 +640,11 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                               : 'font-normal text-slate-700'
                           }`}
                         >
-                          {msg.subject}
+                          {cleanSubject}
                         </div>
 
-                        <p className="mt-1 text-xs text-slate-500 line-clamp-1">{msg.snippet}</p>
+                        <p className="mt-1 text-xs text-slate-500 line-clamp-1">{cleanSnippet}</p>
 
-                        {/* Clean unboxed metadata row (zero pills) */}
                         <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500 flex-wrap">
                           {matchedRule ? (
                             <span
@@ -762,16 +655,6 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                           ) : (
                             <span className="font-medium text-slate-500">General</span>
                           )}
-                          <span aria-hidden="true">·</span>
-                          <span>
-                            {msg.classification?.matchedBy === 'directory'
-                              ? 'Directory'
-                              : msg.classification?.matchedBy === 'user_feedback'
-                              ? 'Trained'
-                              : msg.classification
-                              ? 'Gemini AI'
-                              : 'Pending'}
-                          </span>
                           {attachmentCount > 0 && (
                             <>
                               <span aria-hidden="true">·</span>
@@ -787,14 +670,35 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                   })}
 
                   {filteredMessages.length > visibleMessages.length && (
-                    <div className="p-4 text-center bg-slate-50/70">
+                    <div className="p-3 text-center bg-slate-50/70">
                       <button
                         type="button"
                         onClick={() => setVisibleListCount((c) => c + 150)}
-                        className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                        className="px-3.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
                       >
                         Show more ({visibleMessages.length.toLocaleString()} of{' '}
                         {filteredMessages.length.toLocaleString()})
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Subtle Load Older Mail button at the bottom of the email list */}
+                  {syncProgress.hasMore && (
+                    <div className="p-3.5 text-center bg-slate-50/50">
+                      <button
+                        type="button"
+                        onClick={onLoadOlderMail}
+                        disabled={isLoadingOlder || isFetchingMail}
+                        className="px-3.5 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 bg-white border border-slate-200 hover:border-slate-300 rounded-lg inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-60"
+                      >
+                        {isLoadingOlder ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>Loading older mail...</span>
+                          </>
+                        ) : (
+                          <span>Load Older Mail</span>
+                        )}
                       </button>
                     </div>
                   )}
@@ -812,7 +716,6 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
             {selectedMessage ? (
               <EmailReaderView
                 message={selectedMessage}
-                rules={rules}
                 currentIndex={selectedIndex}
                 totalCount={filteredMessages.length}
                 isExpanded={isDesktopExpanded}
@@ -822,7 +725,6 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                 onSelectPrevious={() => handleStepMessage(-1)}
                 onSelectNext={() => handleStepMessage(1)}
                 onToggleReadState={onToggleReadState}
-                onReassignMessage={onReassignMessage}
                 onDownloadAttachment={onDownloadAttachment}
               />
             ) : (
@@ -830,8 +732,8 @@ export const MailWorkspace: React.FC<MailWorkspaceProps> = ({
                 <div className="max-w-sm space-y-2">
                   <h2 className="text-base font-semibold text-slate-900">Select an email to read</h2>
                   <p className="text-xs text-slate-500 leading-relaxed">
-                    Choose any message from the list to inspect its full content, click links,
-                    download attachments, or retrain the classifier with one click.
+                    Choose any message from the list to read its full content and download
+                    attachments.
                   </p>
                 </div>
               </div>

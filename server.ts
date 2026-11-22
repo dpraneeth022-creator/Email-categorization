@@ -16,8 +16,11 @@ import {
   DEFAULT_CLASSIFICATION_RULES,
   canFastPathOfficialWebsiteToGeneral,
   classifyMessageLocallyFallback,
+  decodeHtmlEntities,
   extractDisplayName,
   extractEmailAddress,
+  hasClubSignal,
+  hasSportsCulturalFestSignal,
   isOfficialPopularWebsiteEmail,
   matchMessageDeterministically,
   parseTrainingOrderLocallyFallback,
@@ -76,6 +79,126 @@ const verifiedGmailProfileCache = new Map<string, { email: string; expiresAt: nu
 const MAX_PROFILE_CACHE = 2000;
 const PROFILE_CACHE_TTL_MS = 10 * 60 * 1000;
 
+const RATE_LIMIT_FRIENDLY_MESSAGE =
+  'Sync paused briefly due to Gmail rate limits — retrying automatically.';
+const GMAIL_BACKOFF_DELAYS_MS = [2000, 4000, 8000];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseGmailErrorMeta(rawBody: string): { reason: string; message: string; combined: string } {
+  let message = '';
+  let reason = '';
+  try {
+    const parsed = JSON.parse(rawBody) as {
+      error?: {
+        message?: string;
+        status?: string;
+        errors?: Array<{ reason?: string; message?: string }>;
+      };
+    };
+    message = parsed.error?.message || '';
+    reason = parsed.error?.errors?.[0]?.reason || parsed.error?.status || '';
+  } catch {
+    message = rawBody.slice(0, 220);
+  }
+  return { reason, message, combined: `${reason} ${message}`.toLowerCase() };
+}
+
+function isGmailRateOrQuotaError(status: number, rawBody: string): boolean {
+  if (status === 429) return true;
+  if (status !== 403) return false;
+  const { combined } = parseGmailErrorMeta(rawBody);
+  return (
+    combined.includes('ratelimit') ||
+    combined.includes('rate limit') ||
+    combined.includes('quota') ||
+    combined.includes('userratelimitexceeded') ||
+    combined.includes('dailylimitexceeded') ||
+    combined.includes('too many')
+  );
+}
+
+function sanitizeGmailApiError(
+  status: number,
+  rawBody: string
+): { status: number; code: string; error: string } {
+  const { combined } = parseGmailErrorMeta(rawBody);
+
+  if (status === 401) {
+    return {
+      status: 401,
+      code: 'TOKEN_EXPIRED',
+      error: 'Your college Gmail session expired. Click Re-authorize Gmail to reconnect.',
+    };
+  }
+
+  if (isGmailRateOrQuotaError(status, rawBody)) {
+    return {
+      status: 429,
+      code: 'GMAIL_RATE_LIMITED',
+      error: RATE_LIMIT_FRIENDLY_MESSAGE,
+    };
+  }
+
+  if (status === 403 && (combined.includes('insufficient') || combined.includes('scope'))) {
+    return {
+      status: 403,
+      code: 'INSUFFICIENT_SCOPE',
+      error:
+        'Gmail read permission was not granted during Google sign-in. Click Re-authorize Gmail and allow Gmail access.',
+    };
+  }
+
+  if (status === 403 && (combined.includes('disabled') || combined.includes('not been used'))) {
+    return {
+      status: 403,
+      code: 'GMAIL_API_DISABLED',
+      error: 'Gmail API access is temporarily unavailable. Please try again shortly.',
+    };
+  }
+
+  return {
+    status: status >= 400 ? status : 500,
+    code: 'GMAIL_API_ERROR',
+    error: 'Unable to reach Gmail right now. Please try syncing again in a moment.',
+  };
+}
+
+/**
+ * Fetches a Gmail API URL with automatic exponential backoff (2s, 4s, 8s) on 403 rate/quota
+ * and 429 errors.
+ */
+async function fetchGmailWithBackoff(
+  url: string,
+  authHeader: string
+): Promise<{ response: Response; bodyText: string; rateLimited: boolean }> {
+  let attempt = 0;
+  let sawRateLimit = false;
+
+  while (true) {
+    const response = await fetch(url, { headers: { Authorization: authHeader } });
+    if (response.ok) {
+      const bodyText = await response.text();
+      return { response, bodyText, rateLimited: sawRateLimit };
+    }
+
+    const errBody = await response.text();
+    const isRetryableRate = isGmailRateOrQuotaError(response.status, errBody);
+    const isTransientServer = response.status === 503 || response.status === 500;
+
+    if ((isRetryableRate || isTransientServer) && attempt < GMAIL_BACKOFF_DELAYS_MS.length) {
+      if (isRetryableRate) sawRateLimit = true;
+      await sleep(GMAIL_BACKOFF_DELAYS_MS[attempt]);
+      attempt += 1;
+      continue;
+    }
+
+    return { response, bodyText: errBody, rateLimited: sawRateLimit || isRetryableRate };
+  }
+}
+
 async function verifyCampusGmailToken(
   authHeader: string
 ): Promise<
@@ -97,71 +220,22 @@ async function verifyCampusGmailToken(
     return { ok: true, email: cached.email };
   }
 
-  const profileRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
-    headers: { Authorization: authHeader },
-  });
+  const profileAttempt = await fetchGmailWithBackoff(
+    'https://gmail.googleapis.com/gmail/v1/users/me/profile',
+    authHeader
+  );
 
-  if (!profileRes.ok) {
-    const errBody = await profileRes.text();
-    let parsedMessage = '';
-    let parsedReason = '';
-    try {
-      const parsed = JSON.parse(errBody) as {
-        error?: {
-          message?: string;
-          status?: string;
-          errors?: Array<{ reason?: string; message?: string }>;
-        };
-      };
-      parsedMessage = parsed.error?.message || '';
-      parsedReason = parsed.error?.errors?.[0]?.reason || parsed.error?.status || '';
-    } catch {
-      parsedMessage = errBody.slice(0, 220);
-    }
-
-    const combined = `${parsedReason} ${parsedMessage}`.toLowerCase();
-    if (profileRes.status === 401) {
-      return {
-        ok: false,
-        status: 401,
-        code: 'TOKEN_EXPIRED',
-        error: 'Your college Gmail session expired. Click Re-authorize Gmail to reconnect.',
-      };
-    }
-    if (
-      profileRes.status === 403 &&
-      (combined.includes('insufficient') || combined.includes('scope'))
-    ) {
-      return {
-        ok: false,
-        status: 403,
-        code: 'INSUFFICIENT_SCOPE',
-        error:
-          'Gmail read permission was not granted during Google sign-in. Click "Re-authorize Gmail" and check the "View your email messages and settings" box.',
-      };
-    }
-    if (
-      profileRes.status === 403 &&
-      (combined.includes('disabled') || combined.includes('not been used in project'))
-    ) {
-      return {
-        ok: false,
-        status: 403,
-        code: 'GMAIL_API_DISABLED',
-        error:
-          'The Gmail API is not enabled on the linked Google Cloud project. Enable Gmail API in Google Cloud Console.',
-      };
-    }
-
+  if (!profileAttempt.response.ok) {
+    const friendly = sanitizeGmailApiError(profileAttempt.response.status, profileAttempt.bodyText);
     return {
       ok: false,
-      status: profileRes.status,
-      code: 'GMAIL_API_ERROR',
-      error: `Gmail API error (${profileRes.status}): ${parsedMessage || errBody.slice(0, 200)}`,
+      status: friendly.status,
+      code: friendly.code,
+      error: friendly.error,
     };
   }
 
-  const profileData = (await profileRes.json()) as { emailAddress?: string };
+  const profileData = JSON.parse(profileAttempt.bodyText) as { emailAddress?: string };
   const verifiedEmail = (profileData.emailAddress || '').trim().toLowerCase();
 
   if (!isAllowedCampusEmail(verifiedEmail, ALLOWED_CAMPUS_DOMAINS)) {
@@ -393,21 +467,25 @@ async function classifyBatchWithGemini(
           .join('\n')}`
       : '';
 
-  const systemInstruction = `Classify each email into one of these categories or "general".
+  const systemInstruction = `Classify each email into EXACTLY ONE category from ${JSON.stringify(validCategoryIds)}.
 Rules:
 ${rulesContext}
-- "general": ALL official emails, notifications, newsletters, updates, offers, receipts, OTPs, and account alerts from popular legitimate websites and well-known brands (e.g., Google, YouTube, GitHub, LinkedIn, Amazon, Flipkart, Swiggy, Zomato, Netflix, Spotify, Microsoft, Apple, Canva, Notion, Figma, Coursera, Udemy, LeetCode, HackerRank, Internshala, Unstop, Discord, banks, etc.), plus normal personal mail. NEVER put official emails from popular legitimate websites into "spam".${feedbackContext}
-For "surveys": any email containing surveys, questionnaires, feedback forms, research polls, or asking recipients to fill out a survey (including from @rvce.edu.in faculty or students) MUST be routed to "surveys" and NEVER to "academic".
-For "clubs": any email mentioning the word "club" or "clubs", student club events, club recruitments, inductions, or campus club activities MUST be routed to "clubs" and NEVER to "academic".
-For "volunteering": match calls for volunteers, community service, blood donation, cleanliness/plantation drives, NGO/social outreach, Rotaract, Youth Red Cross, NSS, NCC, charity/relief camps.
-For "spam": ONLY classify as "spam" when sent from UNAUTHORIZED, unverified, or suspicious senders (such as random personal emails, unknown third-party domains, or spoofed addresses) promoting fake/paid internships, fake rewards or lotteries (lucky draws, cash prizes, free gifts), unauthorized scholarships (non-college/non-government scholarship blasts), phishing, crypto/loan/betting scams, or Gmail-flagged SPAM.
+- "general": Personal sent emails, Google security alerts, official emails from popular legitimate websites (GitHub, LinkedIn, Google, Amazon, Flipkart, Swiggy, Zomato, Netflix, Spotify, Coursera, LeetCode, banks, etc.), AND ALL sports emails (trials, physical education, runs), cultural emails (CARV, EVOKE, auditions, music, dance, fashion), and college/departmental fests (REACT, Synergy, Aeromania, Ignitron).
+STRICT PRIORITY RULES:
+1. CLUBS OVERRIDE (HIGHEST PRIORITY OVER ACADEMIC): If the word "club" (case-insensitive) appears anywhere in the subject, sender name, or body—or if it is about club recruitments, club sessions, or club events—classify it EXCLUSIVELY as "clubs", even if sent or forwarded by a lecturer, professor, HOD, Librarian, or Dean.
+2. SURVEYS: Any email containing surveys, questionnaires, feedback forms, or polls MUST go to "surveys" and NEVER "academic".
+3. VOLUNTEERING: NSS, NCC, blood donation, cleanliness/plantation drives, NGO/social outreach, community service, charity camps -> "volunteering".
+4. SPORTS, CULTURAL & FESTS -> "general" (NEVER "academic"): sports trials, physical education, runs, CARV/EVOKE auditions, music, dance, fashion, REACT, Synergy, Aeromania, Ignitron, departmental/college fests.
+5. PROMOTIONS & SPAM -> "spam": Promotional/marketing blasts (Lenovo, Unlox, Corizo), fake/paid internships, fake rewards/lotteries, unauthorized scholarships, phishing/scams, or Gmail-flagged SPAM.
+6. STRICT ACADEMIC -> "academic": Reserve ONLY for coursework, CIE/SEE exams, seating arrangements, syllabus, Google Classroom updates, MATLAB Grader, EL reviews, and official academic circulars. NEVER classify an email as "academic" just because it is from @rvce.edu.in.
+Match sender identity ONLY from the From: address (never To:).${feedbackContext}
 Return valid categoryId from ${JSON.stringify(validCategoryIds)}, confidence (0-1), and a crisp reason (<=12 words).`;
 
   const promptPayload = emails.map((m) => ({
     id: m.id,
     from: m.fromEmail,
-    subject: m.subject,
-    text: (m.snippet || m.bodyExcerpt).slice(0, 260),
+    subject: decodeHtmlEntities(m.subject),
+    text: decodeHtmlEntities(m.snippet || m.bodyExcerpt).slice(0, 260),
     ...(m.labels && m.labels.length > 0 ? { labels: m.labels } : {}),
   }));
 
@@ -482,11 +560,20 @@ Return valid categoryId from ${JSON.stringify(validCategoryIds)}, confidence (0-
         ? 'Matched semantic criteria for this mailbox.'
         : 'Routed to General Inbox.');
 
-    // Guarantee official emails from popular legitimate websites are never placed in Spam
-    if (safeCategory === 'spam') {
-      const sourceEmail = emailById.get(item.id);
-      const senderAddresses = (sourceEmail?.fromEmail || '').split(',').map((s) => s.trim());
-      if (senderAddresses.some((addr) => isOfficialPopularWebsiteEmail(addr))) {
+    const sourceEmail = emailById.get(item.id);
+    if (sourceEmail) {
+      // Clubs override: never let a club email appear in Academic
+      if (safeCategory === 'academic' && allowedSet.has('clubs') && hasClubSignal(sourceEmail)) {
+        safeCategory = 'clubs';
+        reason = 'Routed exclusively to Clubs.';
+      }
+      // Sports, cultural & fests override: always General Inbox, never Academic
+      if (safeCategory === 'academic' && hasSportsCulturalFestSignal(sourceEmail)) {
+        safeCategory = 'general';
+        reason = 'Sports, cultural, or fest mail routed to General Inbox.';
+      }
+      // Protect trusted official websites from false Spam tagging
+      if (safeCategory === 'spam' && isOfficialPopularWebsiteEmail(sourceEmail.fromEmail)) {
         safeCategory = 'general';
         reason = 'Official email from a popular website routed to General Inbox.';
       }
@@ -599,8 +686,17 @@ async function createServer() {
     });
   });
 
-  // Gmail API proxy with campus-domain enforcement, full pagination + fast metadata mode (100 emails/page)
-  app.get('/api/gmail/messages', async (req, res) => {
+  // Shared metadata-first Gmail sync handler: skips cached IDs, batches 15 requests with 500ms pause, exponential backoff on 403/429
+  const handleGmailMetadataSync = async (
+    req: express.Request,
+    res: express.Response,
+    params: {
+      maxResults: number;
+      query: string;
+      pageToken: string;
+      excludeIds: Set<string>;
+    }
+  ) => {
     try {
       const authHeader = req.headers.authorization;
       if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -618,92 +714,31 @@ async function createServer() {
       }
       const verifiedCollegeEmail = campusCheck.email;
 
-      const maxResults = Math.min(100, Math.max(5, Number(req.query.maxResults) || 100));
-      const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-      const pageToken = typeof req.query.pageToken === 'string' ? req.query.pageToken.trim() : '';
-      const mode = req.query.mode === 'full' ? 'full' : 'metadata';
-
       const listParams = new URLSearchParams({
-        maxResults: String(maxResults),
+        maxResults: String(params.maxResults),
         includeSpamTrash: 'true',
       });
-      if (query) {
-        listParams.set('q', query);
-      } else {
-        // Include Inbox, All Mail, Promotions, AND Spam while excluding deleted Trash
-        listParams.set('q', '-in:trash');
-      }
-      if (pageToken) {
-        listParams.set('pageToken', pageToken);
+      listParams.set('q', params.query || '-in:trash');
+      if (params.pageToken) {
+        listParams.set('pageToken', params.pageToken);
       }
 
-      const listResponse = await fetch(
+      const listAttempt = await fetchGmailWithBackoff(
         `https://gmail.googleapis.com/gmail/v1/users/me/messages?${listParams.toString()}`,
-        {
-          headers: { Authorization: authHeader },
-        }
+        authHeader
       );
 
-      if (!listResponse.ok) {
-        const errBody = await listResponse.text();
-        let parsedMessage = '';
-        let parsedReason = '';
-        try {
-          const parsed = JSON.parse(errBody) as {
-            error?: {
-              message?: string;
-              status?: string;
-              errors?: Array<{ reason?: string; message?: string }>;
-            };
-          };
-          parsedMessage = parsed.error?.message || '';
-          parsedReason = parsed.error?.errors?.[0]?.reason || parsed.error?.status || '';
-        } catch {
-          parsedMessage = errBody.slice(0, 220);
-        }
-
-        const combined = `${parsedReason} ${parsedMessage}`.toLowerCase();
-
-        if (listResponse.status === 401) {
-          res.status(401).json({
-            code: 'TOKEN_EXPIRED',
-            error: 'Your Gmail session expired. Click Re-authorize Gmail to reconnect.',
-          });
-          return;
-        }
-
-        if (
-          listResponse.status === 403 &&
-          (combined.includes('insufficient') || combined.includes('scope'))
-        ) {
-          res.status(403).json({
-            code: 'INSUFFICIENT_SCOPE',
-            error:
-              'Gmail read permission was not granted during Google sign-in. Click "Re-authorize Gmail" and make sure the "View your email messages and settings" box is checked.',
-          });
-          return;
-        }
-
-        if (
-          listResponse.status === 403 &&
-          (combined.includes('disabled') || combined.includes('not been used in project'))
-        ) {
-          res.status(403).json({
-            code: 'GMAIL_API_DISABLED',
-            error:
-              'The Gmail API is disabled on the linked Google Cloud project. Enable Gmail API in Google Cloud Console.',
-          });
-          return;
-        }
-
-        res.status(listResponse.status).json({
-          code: 'GMAIL_API_ERROR',
-          error: `Gmail API error (${listResponse.status}): ${parsedMessage || errBody.slice(0, 200)}`,
+      if (!listAttempt.response.ok) {
+        const friendly = sanitizeGmailApiError(listAttempt.response.status, listAttempt.bodyText);
+        res.status(friendly.status).json({
+          code: friendly.code,
+          error: friendly.error,
+          rateLimited: friendly.code === 'GMAIL_RATE_LIMITED',
         });
         return;
       }
 
-      const listData = (await listResponse.json()) as {
+      const listData = JSON.parse(listAttempt.bodyText) as {
         messages?: Array<{ id: string; threadId?: string }>;
         nextPageToken?: string;
         resultSizeEstimate?: number;
@@ -715,36 +750,59 @@ async function createServer() {
           messages: [],
           nextPageToken: null,
           resultSizeEstimate: listData.resultSizeEstimate || 0,
+          skippedCachedCount: 0,
+          rateLimited: false,
         });
         return;
       }
 
+      // Skip already-cached message IDs BEFORE calling messages.get
+      const uncachedStubs = messageStubs.filter((stub) => !params.excludeIds.has(stub.id));
+      const skippedCachedCount = messageStubs.length - uncachedStubs.length;
+
+      if (uncachedStubs.length === 0) {
+        res.json({
+          messages: [],
+          nextPageToken: listData.nextPageToken || null,
+          resultSizeEstimate: listData.resultSizeEstimate || messageStubs.length,
+          skippedCachedCount,
+          allPageCached: true,
+          rateLimited: false,
+        });
+        return;
+      }
+
+      // Strict lightweight metadata-first query (only From, To, Subject, Date)
       const metadataQuery =
-        'format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Reply-To&metadataHeaders=X-Original-Sender&metadataHeaders=X-Google-Original-From&metadataHeaders=Sender';
+        'format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date';
 
-      const fetchStubWithRetry = async (stubId: string) => {
-        const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${stubId}?${
-          mode === 'full' ? 'format=full' : metadataQuery
-        }`;
-        let detailRes = await fetch(url, { headers: { Authorization: authHeader } });
-        if (detailRes.status === 429 || detailRes.status === 503) {
-          await new Promise((r) => setTimeout(r, 380));
-          detailRes = await fetch(url, { headers: { Authorization: authHeader } });
-        }
-        return detailRes;
-      };
-
-      // Fetch message details in fast parallel bursts tuned to Gmail quota
       const fetchedMessages: MailMessage[] = [];
-      const chunkSize = mode === 'full' ? 16 : 22;
+      const batchSize = 15;
+      const batchPauseMs = 500;
+      let hitRateLimit = listAttempt.rateLimited;
+      let abortedByRateLimit = false;
 
-      for (let i = 0; i < messageStubs.length; i += chunkSize) {
-        const chunk = messageStubs.slice(i, i + chunkSize);
+      for (let i = 0; i < uncachedStubs.length; i += batchSize) {
+        const chunk = uncachedStubs.slice(i, i + batchSize);
+        let chunkFatalRateLimit = false;
+
         const chunkResults = await Promise.all(
           chunk.map(async (stub) => {
-            const detailRes = await fetchStubWithRetry(stub.id);
-            if (!detailRes.ok) return null;
-            const detail = (await detailRes.json()) as {
+            const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
+              stub.id
+            )}?${metadataQuery}`;
+            const detailAttempt = await fetchGmailWithBackoff(url, authHeader);
+            if (detailAttempt.rateLimited) {
+              hitRateLimit = true;
+            }
+            if (!detailAttempt.response.ok) {
+              if (isGmailRateOrQuotaError(detailAttempt.response.status, detailAttempt.bodyText)) {
+                chunkFatalRateLimit = true;
+              }
+              return null;
+            }
+
+            const detail = JSON.parse(detailAttempt.bodyText) as {
               id: string;
               threadId?: string;
               snippet?: string;
@@ -760,51 +818,18 @@ async function createServer() {
               headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value ?? '';
 
             const rawFrom = getHeader('From');
-            const rawReplyTo = getHeader('Reply-To');
-            const rawOriginalSender =
-              getHeader('X-Original-Sender') || getHeader('X-Google-Original-From') || getHeader('Sender');
-            const to = getHeader('To');
-            const subject = getHeader('Subject') || '(No Subject)';
+            const to = decodeHtmlEntities(getHeader('To'));
+            const subject = decodeHtmlEntities(getHeader('Subject') || '(No Subject)');
             const internalMs = Number(detail.internalDate);
             const dateIso = Number.isFinite(internalMs)
               ? new Date(internalMs).toISOString()
               : new Date().toISOString();
             const threadRef = encodeURIComponent(detail.threadId || detail.id);
-            const snippet = (detail.snippet || '').trim();
+            const snippet = decodeHtmlEntities((detail.snippet || '').trim());
 
             const gmailWebLink = `https://mail.google.com/mail/?authuser=${encodeURIComponent(
               verifiedCollegeEmail
             )}#all/${threadRef}`;
-
-            if (mode === 'metadata') {
-              const normalized: MailMessage = {
-                id: detail.id,
-                threadId: detail.threadId,
-                provider: 'gmail',
-                fromName: extractDisplayName(rawFrom),
-                fromEmail: extractEmailAddress(rawFrom),
-                replyTo: rawReplyTo ? extractEmailAddress(rawReplyTo) : undefined,
-                originalSender: rawOriginalSender ? extractEmailAddress(rawOriginalSender) : undefined,
-                to,
-                subject,
-                snippet,
-                bodyText: snippet,
-                webLink: gmailWebLink,
-                labelIds: detail.labelIds,
-                fullBodyLoaded: false,
-                dateIso,
-                unread: Boolean(detail.labelIds?.includes('UNREAD')),
-              };
-              return normalized;
-            }
-
-            const {
-              bodyText: extractedText,
-              bodyHtml,
-              attachments,
-            } = extractRichContentFromGmailPayload(detail.payload);
-            const bodyText = extractedText || snippet || '';
-            const resolvedHtml = bodyHtml ? resolveInlineCidImages(bodyHtml, attachments) : undefined;
 
             const normalized: MailMessage = {
               id: detail.id,
@@ -812,17 +837,13 @@ async function createServer() {
               provider: 'gmail',
               fromName: extractDisplayName(rawFrom),
               fromEmail: extractEmailAddress(rawFrom),
-              replyTo: rawReplyTo ? extractEmailAddress(rawReplyTo) : undefined,
-              originalSender: rawOriginalSender ? extractEmailAddress(rawOriginalSender) : undefined,
               to,
               subject,
-              snippet: (snippet || bodyText.slice(0, 160)).trim(),
-              bodyText,
-              bodyHtml: resolvedHtml,
+              snippet,
+              bodyText: snippet,
               webLink: gmailWebLink,
-              attachments: attachments.length > 0 ? attachments : undefined,
               labelIds: detail.labelIds,
-              fullBodyLoaded: true,
+              fullBodyLoaded: false,
               dateIso,
               unread: Boolean(detail.labelIds?.includes('UNREAD')),
             };
@@ -833,22 +854,77 @@ async function createServer() {
         for (const msg of chunkResults) {
           if (msg) fetchedMessages.push(msg);
         }
+
+        if (chunkFatalRateLimit) {
+          abortedByRateLimit = true;
+          break;
+        }
+
+        // Sequential 500ms pause between batches of 15 concurrent requests
+        if (i + batchSize < uncachedStubs.length) {
+          await sleep(batchPauseMs);
+        }
+      }
+
+      if (abortedByRateLimit && fetchedMessages.length === 0) {
+        res.status(429).json({
+          code: 'GMAIL_RATE_LIMITED',
+          error: RATE_LIMIT_FRIENDLY_MESSAGE,
+          rateLimited: true,
+        });
+        return;
       }
 
       res.json({
         messages: fetchedMessages,
-        nextPageToken: listData.nextPageToken || null,
+        nextPageToken: abortedByRateLimit ? params.pageToken || null : listData.nextPageToken || null,
         resultSizeEstimate: listData.resultSizeEstimate || fetchedMessages.length,
+        skippedCachedCount,
+        allPageCached: false,
+        rateLimited: hitRateLimit || abortedByRateLimit,
+        statusNotice: abortedByRateLimit ? RATE_LIMIT_FRIENDLY_MESSAGE : undefined,
       });
     } catch (error) {
-      console.error('Gmail messages route error:', error);
+      console.error('Gmail sync route error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Failed to fetch Gmail messages.',
+        error: 'Unable to sync Gmail right now. Please try again in a moment.',
       });
     }
+  };
+
+  // Primary metadata-first incremental sync endpoint (supports large excludeIds arrays cleanly)
+  app.post('/api/gmail/sync', async (req, res) => {
+    const body = (req.body || {}) as {
+      maxResults?: number;
+      q?: string;
+      pageToken?: string;
+      excludeIds?: string[];
+    };
+    const maxResults = Math.min(100, Math.max(5, Number(body.maxResults) || 60));
+    const query = typeof body.q === 'string' ? body.q.trim() : '';
+    const pageToken = typeof body.pageToken === 'string' ? body.pageToken.trim() : '';
+    const excludeIds = new Set<string>(
+      Array.isArray(body.excludeIds)
+        ? body.excludeIds.filter((id): id is string => typeof id === 'string')
+        : []
+    );
+    await handleGmailMetadataSync(req, res, { maxResults, query, pageToken, excludeIds });
   });
 
-  // On-demand full Gmail message loader (fetches full HTML, plain text, and attachments when an email is opened)
+  // Backwards-compatible GET route delegating to the same metadata-first paced handler
+  app.get('/api/gmail/messages', async (req, res) => {
+    const maxResults = Math.min(100, Math.max(5, Number(req.query.maxResults) || 60));
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const pageToken = typeof req.query.pageToken === 'string' ? req.query.pageToken.trim() : '';
+    await handleGmailMetadataSync(req, res, {
+      maxResults,
+      query,
+      pageToken,
+      excludeIds: new Set<string>(),
+    });
+  });
+
+  // On-demand full Gmail message loader (fetches format=full HTML, plain text, and attachments ONLY when clicked)
   app.get('/api/gmail/messages/:messageId', async (req, res) => {
     try {
       const authHeader = req.headers.authorization;
@@ -867,27 +943,23 @@ async function createServer() {
       }
 
       const { messageId } = req.params;
-      const detailRes = await fetch(
+      const detailAttempt = await fetchGmailWithBackoff(
         `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
           messageId
         )}?format=full`,
-        {
-          headers: { Authorization: authHeader },
-        }
+        authHeader
       );
 
-      if (!detailRes.ok) {
-        const errText = await detailRes.text();
-        res.status(detailRes.status).json({
-          error:
-            detailRes.status === 401
-              ? 'Your Gmail session expired. Click Re-authorize Gmail to open full messages.'
-              : `Could not load full email (${detailRes.status}): ${errText.slice(0, 160)}`,
+      if (!detailAttempt.response.ok) {
+        const friendly = sanitizeGmailApiError(detailAttempt.response.status, detailAttempt.bodyText);
+        res.status(friendly.status).json({
+          code: friendly.code,
+          error: friendly.error,
         });
         return;
       }
 
-      const detail = (await detailRes.json()) as {
+      const detail = JSON.parse(detailAttempt.bodyText) as {
         id: string;
         threadId?: string;
         snippet?: string;
@@ -899,7 +971,7 @@ async function createServer() {
         bodyHtml,
         attachments,
       } = extractRichContentFromGmailPayload(detail.payload);
-      const bodyText = extractedText || detail.snippet || '';
+      const bodyText = extractedText || decodeHtmlEntities(detail.snippet || '');
       const resolvedHtml = bodyHtml ? resolveInlineCidImages(bodyHtml, attachments) : undefined;
 
       res.json({
@@ -912,7 +984,7 @@ async function createServer() {
     } catch (error) {
       console.error('Gmail single message route error:', error);
       res.status(500).json({
-        error: error instanceof Error ? error.message : 'Failed to load full email.',
+        error: 'Unable to load the full message right now. Please try again.',
       });
     }
   });
@@ -1727,10 +1799,12 @@ async function createServer() {
         const directMatch = matchMessageDeterministically(msg, activeRules);
         if (directMatch) {
           classifications[msg.id] = {
-            categoryId: directMatch.rule.id,
+            categoryId: directMatch.categoryId,
             confidence: 1.0,
             matchedBy: 'directory',
-            reason: `Matched trained ${directMatch.rule.shortName} rule (${directMatch.matchedEntry}).`,
+            reason: directMatch.rule
+              ? `Matched ${directMatch.rule.shortName} (${directMatch.matchedEntry}).`
+              : `Routed to General Inbox (${directMatch.matchedEntry}).`,
           };
           continue;
         }
@@ -1760,10 +1834,10 @@ async function createServer() {
           id: msg.id,
           cacheKey,
           fromName: msg.fromName,
-          fromEmail: [msg.fromEmail, msg.replyTo, msg.originalSender].filter(Boolean).join(', '),
-          subject: msg.subject,
-          snippet: msg.snippet,
-          bodyExcerpt: (msg.bodyText || msg.snippet || '').slice(0, 240),
+          fromEmail: msg.fromEmail,
+          subject: decodeHtmlEntities(msg.subject),
+          snippet: decodeHtmlEntities(msg.snippet),
+          bodyExcerpt: decodeHtmlEntities((msg.bodyText || msg.snippet || '').slice(0, 240)),
           labels: relevantLabels.length > 0 ? relevantLabels : undefined,
         });
       }
@@ -1900,10 +1974,12 @@ async function createServer() {
       const directMatch = matchMessageDeterministically(testMsg, activeRules);
       if (directMatch) {
         const result: MailClassification = {
-          categoryId: directMatch.rule.id,
+          categoryId: directMatch.categoryId,
           confidence: 1.0,
           matchedBy: 'directory',
-          reason: `Matched trained ${directMatch.rule.name} rule (${directMatch.matchedEntry}).`,
+          reason: directMatch.rule
+            ? `Matched ${directMatch.rule.name} (${directMatch.matchedEntry}).`
+            : `Routed to General Inbox (${directMatch.matchedEntry}).`,
         };
         res.json({ classification: result });
         return;

@@ -426,7 +426,7 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRule[] = [
     name: 'CLUBS',
     shortName: 'Clubs',
     description:
-      'Campus club notices, student club inductions, recruitments, workshops, meetings, and emails containing the word club or clubs — always kept separate from Academic Mails.',
+      'Any email mentioning the word "club" in subject, sender, or body, plus club recruitments, club sessions, inductions, and club events — strictly separated from Academic Mails even when sent or forwarded by faculty, HOD, Librarian, or Dean.',
     accent: 'violet',
     senders: [],
     keywords: [
@@ -437,6 +437,7 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRule[] = [
       'robotics club',
       'club recruitment',
       'club induction',
+      'club session',
       'club event',
       'club meeting',
     ],
@@ -472,26 +473,32 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRule[] = [
     name: 'ACADEMIC MAILS',
     shortName: 'Academic',
     description:
-      'Official communications from RVCE faculty, HODs, Deans, Principal, COE, Placement cell, CTTO First Year, department mailing lists (@rvce.edu.in / @rvei.edu.in), RSST engineering offices, and MathWorks MATLAB Grader.',
+      'Strictly reserved for coursework, CIE/SEE exams, seating arrangements, syllabus, Google Classroom updates, MATLAB Grader, EL reviews, and official academic circulars.',
     accent: 'blue',
     senders: [
-      ...RVCE_ACADEMIC_SENDERS,
-      'rvce.edu.in',
-      'rvei.edu.in',
+      'mail.grader.mathworks.com',
+      'classroom.google.com',
+      'no-reply@classroom.google.com',
     ],
     keywords: [
-      'rvce',
-      'mathworks grader',
+      'cie',
+      'see exam',
+      'seating arrangement',
+      'syllabus',
+      'google classroom',
       'matlab grader',
-      'cie schedule',
-      'see examination',
-      'rvce academic',
-      'placement cell',
-      'first year ctto',
+      'mathworks grader',
+      'el review',
+      'experiential learning',
+      'coursework',
+      'assignment',
       'timetable',
       'lab manual',
       'internal assessment',
-      'google classroom',
+      'academic circular',
+      'hall ticket',
+      'makeup exam',
+      'revaluation',
     ],
     useAiSemantics: true,
     isSystemDefault: true,
@@ -501,10 +508,19 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRule[] = [
     name: 'SPAM MAILS',
     shortName: 'Spam',
     description:
-      'Fake internships, rewards and lottery claims, unauthorized scholarship blasts, phishing, and scams sent from unauthorized or unverified senders — while official emails from popular websites stay in General Inbox.',
+      'Promotional and marketing blasts (Lenovo, Unlox, Corizo), fake or paid internships, rewards and lottery claims, unauthorized scholarships, phishing, and scams.',
     accent: 'rose',
-    senders: [],
+    senders: [
+      'lenovo.com',
+      'unlox.com',
+      'unlox.in',
+      'corizo.in',
+      'corizo.com',
+    ],
     keywords: [
+      'lenovo',
+      'unlox',
+      'corizo',
       'fake internship',
       'paid internship',
       'virtual internship',
@@ -535,6 +551,37 @@ export const DEFAULT_CLASSIFICATION_RULES: ClassificationRule[] = [
   },
 ];
 
+export const CURRENT_RULES_VERSION = 'v7_strict_single_category';
+
+/**
+ * Decodes HTML entities (&#39;, &quot;, &amp;, &lt;, &gt;, numeric hex/decimal entities)
+ * so email snippets and subjects render cleanly.
+ */
+export function decodeHtmlEntities(input?: string | null): string {
+  if (!input) return '';
+  return input
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex: string) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _m;
+    })
+    .replace(/&#(\d+);/g, (_m, dec: string) => {
+      const code = Number.parseInt(dec, 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _m;
+    })
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&ndash;/gi, '–')
+    .replace(/&mdash;/gi, '—')
+    .replace(/&hellip;/gi, '…')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function extractEmailAddress(rawFrom: string): string {
   const angleMatch = rawFrom.match(/<([^>]+)>/);
   if (angleMatch?.[1]) {
@@ -550,94 +597,83 @@ export function extractEmailAddress(rawFrom: string): string {
 export function extractDisplayName(rawFrom: string): string {
   const angleMatch = rawFrom.match(/^([^<]+)<[^>]+>/);
   if (angleMatch?.[1]) {
-    const cleaned = angleMatch[1].replace(/^["'\s]+|["'\s]+$/g, '');
+    const cleaned = decodeHtmlEntities(angleMatch[1].replace(/^["'\s]+|["'\s]+$/g, ''));
     if (cleaned.length > 0) return cleaned;
   }
   const email = extractEmailAddress(rawFrom);
   const local = email.split('@')[0] || rawFrom;
-  return local;
+  return decodeHtmlEntities(local);
 }
 
 /**
- * Extracts all candidate sender emails from a message, including Reply-To,
- * X-Original-Sender (Google Groups), and forwarded "From:" headers in the body.
+ * Strictly extracts ONLY the From: email address (never inspects To: or forwarded body headers).
  */
 export function extractCandidateSenders(input: {
   fromEmail?: string;
-  replyTo?: string;
-  originalSender?: string;
-  subject?: string;
-  snippet?: string;
-  bodyText?: string;
 }): string[] {
-  const found = new Set<string>();
-  const addRaw = (val?: string) => {
-    if (!val) return;
-    const matches = val.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
-    if (matches) {
-      for (const m of matches) found.add(m.toLowerCase());
-    } else {
-      const cleaned = extractEmailAddress(val);
-      if (cleaned) found.add(cleaned);
-    }
-  };
-
-  addRaw(input.fromEmail);
-  addRaw(input.replyTo);
-  addRaw(input.originalSender);
-
-  // If forwarded email, inspect leading forwarded From/Sender header lines in body
-  const headText = (input.bodyText || input.snippet || '').slice(0, 800);
-  const forwardedFromRegex = /(?:^|\n)\s*(?:from|sender|reply-to)\s*:\s*([^\n]+)/gi;
-  let match: RegExpExecArray | null;
-  while ((match = forwardedFromRegex.exec(headText)) !== null) {
-    addRaw(match[1]);
-  }
-
-  return Array.from(found);
+  if (!input.fromEmail) return [];
+  const addr = extractEmailAddress(input.fromEmail);
+  return addr ? [addr] : [];
 }
 
 const VOLUNTEERING_SIGNAL_REGEX =
   /\b(volunteering|volunteer|volunteers|nss|ncc|blood\s+donation|cleanliness\s+drive|swachh\s+bharat|plantation\s+drive|community\s+service|social\s+outreach|rotaract|youth\s+red\s+cross|relief\s+camp|charity\s+drive|ngo\b|donation\s+camp|civic\s+service)\b/i;
 
-const CLUB_WORD_REGEX = /\bclubs?\b/i;
+// Matches "club" or "clubs" case-insensitively anywhere (word boundary or embedded in club names/handles)
+const CLUB_WORD_REGEX = /\bclubs?\b|club\s*(?:recruitment|recruitments|induction|inductions|session|sessions|event|events|meeting|meetings|orientation|activity|activities|members?|registration|registrations|fair|expo)/i;
 
 const SURVEY_SIGNAL_REGEX =
   /\b(surveys?|questionnaires?|feedback\s+forms?|course\s+feedback|student\s+feedback|campus\s+poll|opinion\s+poll|surveymonkey|qualtrics|typeform)\b/i;
 
-export function hasStrongVolunteeringSignal(subject?: string, snippet?: string, bodyText?: string): boolean {
-  const combined = `${subject || ''} ${snippet || ''} ${(bodyText || '').slice(0, 500)}`;
+// Sports, Cultural & College/Departmental Fest emails → General Inbox (NEVER Academic)
+const SPORTS_CULTURAL_FEST_REGEX =
+  /\b(sports\s+trials?|selection\s+trials?|physical\s+education|dept\.?\s+of\s+physical\s+education|department\s+of\s+physical\s+education|sports\s+day|annual\s+sports|inter-?collegiate\s+(?:sports|tournament|match)|marathon|cyclothon|walkathon|fun\s+run|rvce\s+run|5k\s+run|10k\s+run|athletics\s+meet|cricket\s+trials?|football\s+trials?|basketball\s+trials?|badminton\s+trials?|volleyball\s+trials?|kabaddi\s+trials?|throwball\s+trials?|chess\s+trials?|table\s+tennis\s+trials?|swimming\s+trials?|carv\b|evoke\b|auditions?\b|cultural\s+(?:auditions?|team|fest|event|events|night|day)|fashion\s+(?:show|team|auditions?)|dance\s+(?:auditions?|team|competition|troupe)|music\s+(?:auditions?|team|competition|night)|battle\s+of\s+bands|alaap\b|footprints?\b|8th\s*mile|eighth\s+mile|react\s+(?:20\d\d|fest|symposium|event|tech)|synergy\s*(?:20\d\d|fest|event|rvce)?|\bsynergy\b|\baeromania\b|\bignitron\b|\btech\s*fest\b|\bcollege\s+fest\b|\bdepartment(?:al)?\s+fest\b|\bannual\s+fest\b|\bfest\s+registration\b|\bcultural\s+extravaganza\b)\b/i;
+
+const REACT_FEST_REGEX = /\bREACT\b/;
+
+// Promotional & Marketing blasts explicitly marked as Spam (Lenovo, Unlox, Corizo, etc.)
+const PROMOTIONAL_SPAM_BRANDS_REGEX = /\b(lenovo|unlox|corizo)\b/i;
+
+// Google Security Alerts → General Inbox
+const GOOGLE_SECURITY_ALERT_REGEX =
+  /\b(security\s+alert|critical\s+security\s+alert|new\s+sign-?in|2-?step\s+verification|recovery\s+(?:email|phone)|app\s+password\s+created|google\s+account\s+security)\b/i;
+
+// Strict Academic signal: coursework, CIE/SEE exams, seating arrangements, syllabus, Google Classroom, MATLAB Grader, EL reviews, official academic circulars
+const STRICT_ACADEMIC_REGEX =
+  /\b(cie\b|cie-?\s*[123]|see\s+(?:exam|examination|timetable|schedule|result|results|seating)|seating\s+arrangement|exam\s+(?:seating|schedule|timetable|hall|centre|center|notification|circular|form|registration|result|results)|examination\s+(?:schedule|timetable|circular|notification|seating)|hall\s+ticket|revaluation|makeup\s+exam|make-?up\s+exam|supplementary\s+exam|syllabus|coursework|course\s+(?:registration|plan|material|outline|handout|drop|add)|google\s+classroom|new\s+(?:assignment|material|announcement)\s*:|matlab\s+grader|mathworks\s+grader|\bel\s+(?:review|reviews|phase|presentation|submission|evaluation|rubric|topic|report)\b|experiential\s+learning|project\s+(?:review|evaluation|submission|viva)|mini-?project\s+(?:review|viva)|lab\s+(?:manual|exam|test|internal|schedule|record|observation|viva)|internal\s+assessment|time\s*table|class\s+schedule|academic\s+(?:calendar|circular|schedule|council|regulation|notice|dean)|office\s+of\s+(?:dean\s+academics|controller\s+of\s+examinations|coe\b)|commencement\s+of\s+(?:classes|semester)|odd\s+semester|even\s+semester|attendance\s+(?:shortage|detention|list|update)|assignment\s+(?:due|submission|deadline|posted)|quiz\s+(?:schedule|link|marks)|marks\s+(?:sheet|list|published|uploaded)|grade\s+(?:card|sheet)|cgpa|sgpa|vtu\s+circular|working\s+saturday|class\s+(?:rescheduled|cancelled|postponed|timings)|lecture\s+(?:notes|slides)|semester\s+end\s+exam|backlog\s+exam)\b/i;
+
+export function hasStrongVolunteeringSignal(
+  subject?: string,
+  snippet?: string,
+  bodyText?: string
+): boolean {
+  const combined = decodeHtmlEntities(
+    `${subject || ''} ${snippet || ''} ${(bodyText || '').slice(0, 600)}`
+  );
   return VOLUNTEERING_SIGNAL_REGEX.test(combined);
 }
 
 export function hasSurveySignal(input: {
   fromName?: string;
   fromEmail?: string;
-  replyTo?: string;
-  originalSender?: string;
-  to?: string;
   subject?: string;
   snippet?: string;
   bodyText?: string;
 }): boolean {
-  const textCombined = `${input.fromName || ''} ${input.subject || ''} ${input.snippet || ''} ${(
-    input.bodyText || ''
-  ).slice(0, 1200)}`;
+  const textCombined = decodeHtmlEntities(
+    `${input.fromName || ''} ${input.subject || ''} ${input.snippet || ''} ${(
+      input.bodyText || ''
+    ).slice(0, 1200)}`
+  );
   if (SURVEY_SIGNAL_REGEX.test(textCombined)) {
     return true;
   }
 
-  const addrFields = [input.fromEmail, input.replyTo, input.originalSender, input.to];
-  for (const field of addrFields) {
-    if (!field) continue;
-    const matches = field.toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/g);
-    if (matches) {
-      for (const addr of matches) {
-        const localPart = addr.split('@')[0] || '';
-        if (localPart.includes('survey')) {
-          return true;
-        }
-      }
+  const fromAddr = extractEmailAddress(input.fromEmail || '');
+  if (fromAddr) {
+    const localPart = fromAddr.split('@')[0] || '';
+    if (localPart.includes('survey')) {
+      return true;
     }
   }
 
@@ -647,40 +683,94 @@ export function hasSurveySignal(input: {
 export function hasClubSignal(input: {
   fromName?: string;
   fromEmail?: string;
-  replyTo?: string;
-  originalSender?: string;
-  to?: string;
   subject?: string;
   snippet?: string;
   bodyText?: string;
 }): boolean {
-  const textCombined = `${input.fromName || ''} ${input.subject || ''} ${input.snippet || ''} ${(
-    input.bodyText || ''
-  ).slice(0, 1200)}`;
+  const textCombined = decodeHtmlEntities(
+    `${input.fromName || ''} ${input.subject || ''} ${input.snippet || ''} ${(
+      input.bodyText || ''
+    ).slice(0, 1500)}`
+  );
   if (CLUB_WORD_REGEX.test(textCombined)) {
     return true;
   }
 
-  // Also detect campus club email addresses like codingclub@rvce.edu.in or dramaclub@rvce.edu.in
-  const addrFields = [input.fromEmail, input.replyTo, input.originalSender, input.to];
-  for (const field of addrFields) {
-    if (!field) continue;
-    const matches = field.toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/g);
-    if (matches) {
-      for (const addr of matches) {
-        const localPart = addr.split('@')[0] || '';
-        if (localPart.includes('club')) {
-          return true;
-        }
-      }
+  // Strictly inspect ONLY the From: email address (never To:)
+  const fromAddr = extractEmailAddress(input.fromEmail || '');
+  if (fromAddr) {
+    const localPart = fromAddr.split('@')[0] || '';
+    if (localPart.includes('club')) {
+      return true;
     }
   }
 
   return false;
 }
 
+export function hasSportsCulturalFestSignal(input: {
+  fromName?: string;
+  fromEmail?: string;
+  subject?: string;
+  snippet?: string;
+  bodyText?: string;
+}): boolean {
+  const rawCombined = decodeHtmlEntities(
+    `${input.fromName || ''} ${input.subject || ''} ${input.snippet || ''} ${(
+      input.bodyText || ''
+    ).slice(0, 1000)}`
+  );
+  if (SPORTS_CULTURAL_FEST_REGEX.test(rawCombined)) {
+    return true;
+  }
+  // Uppercase "REACT" fest mention (avoids matching lowercase "react" in normal English or React.js coursework unless fest context)
+  if (
+    REACT_FEST_REGEX.test(`${input.subject || ''} ${input.snippet || ''}`) &&
+    !/\b(react\.?js|reactjs|frontend|javascript|component|useState|useEffect)\b/i.test(rawCombined)
+  ) {
+    return true;
+  }
+  const fromAddr = extractEmailAddress(input.fromEmail || '');
+  if (
+    fromAddr &&
+    /\b(sports|physicaleducation|ped|cultural|carv|evoke|8thmile|aeromania|ignitron|synergy)\b/i.test(
+      fromAddr.split('@')[0] || ''
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function hasStrictAcademicSignal(input: {
+  fromName?: string;
+  fromEmail?: string;
+  subject?: string;
+  snippet?: string;
+  bodyText?: string;
+}): boolean {
+  const fromAddr = extractEmailAddress(input.fromEmail || '');
+  const domain = getDomainFromAddress(fromAddr);
+  // Inherently academic platforms
+  if (
+    domain === 'mail.grader.mathworks.com' ||
+    domain.endsWith('.grader.mathworks.com') ||
+    domain === 'classroom.google.com' ||
+    fromAddr === 'no-reply@classroom.google.com'
+  ) {
+    return true;
+  }
+
+  const combined = decodeHtmlEntities(
+    `${input.fromName || ''} ${input.subject || ''} ${input.snippet || ''} ${(
+      input.bodyText || ''
+    ).slice(0, 1200)}`
+  );
+  return STRICT_ACADEMIC_REGEX.test(combined);
+}
+
 /**
- * Matches a single email address against exact entries or domain entries in a rule.
+ * Matches a single From: email address against exact entries or domain entries in a rule.
  */
 function matchAddressAgainstRule(
   normalizedEmail: string,
@@ -701,11 +791,7 @@ function matchAddressAgainstRule(
         return entry;
       }
     } else if (!exactOnly) {
-      if (
-        domainPart === entry ||
-        domainPart.endsWith(`.${entry}`) ||
-        normalizedEmail.includes(entry)
-      ) {
+      if (domainPart === entry || domainPart.endsWith(`.${entry}`)) {
         return entry;
       }
     }
@@ -716,7 +802,7 @@ function matchAddressAgainstRule(
 /**
  * Official domains of popular, legitimate websites and platforms.
  * Emails from these official domains go to General Inbox (not Spam), unless
- * matched to a dedicated campus category (Volunteering, Surveys, Clubs, Academic).
+ * matched to a dedicated campus category or promotional spam blocklist.
  */
 export const TRUSTED_POPULAR_DOMAINS: readonly string[] = [
   // Tech, Cloud & Developer Platforms
@@ -886,132 +972,177 @@ const OBVIOUS_SPAM_SIGNAL_REGEX =
 const UNAUTHORIZED_FAKE_OPPORTUNITY_SPAM_REGEX =
   /\b(fake\s+internship|paid\s+internship|virtual\s+internship|internship\s+with\s+certificate|guaranteed\s+internship|guaranteed\s+stipend|stipend\s+up\s+to|training\s*(?:&|and|\+)\s*internship|industrial\s+training\s*(?:&|and)\s*internship|register\s+now\s+for\s+internship|summer\s+internship\s+program|winter\s+internship\s+program|internship\s+offer\s+letter|free\s+scholarship|scholarship\s+awarded|selected\s+for\s+(?:a\s+)?scholarship|claim\s+your\s+scholarship|scholarship\s+grant|apply\s+now\s+for\s+scholarship|reward\s+points\s+expiring|exclusive\s+cash\s+reward|won\s+(?:a\s+)?(?:reward|lottery|voucher|iphone)|lottery\s+ticket|mega\s+reward)\b/i;
 
+export interface DeterministicMatchResult {
+  categoryId: string;
+  rule: ClassificationRule | null;
+  matchedEntry: string;
+}
+
 /**
- * Deterministic sender/domain matcher with full support for:
- * 1. Exact Volunteering senders (nss@rvce.edu.in, nccrvce@rvce.edu.in) — highest priority
- * 2. Surveys (survey/questionnaire/feedback forms) — always separated from Academic Mails
- * 3. Clubs (word "club"/"clubs" or club sender addresses) — always separated from Academic Mails
- * 4. Exact listed Academic, Spam & Custom senders across From, Reply-To, X-Original-Sender, and forwarded headers
- * 5. Institutional domain matches (mail.grader.mathworks.com, rvce.edu.in, rvei.edu.in) and RVCE mailing list To: headers
- * 6. Unauthorized spam (fake internships, rewards & lottery, unauthorized scholarships, scams, Gmail SPAM) — while protecting official emails from popular websites
+ * Strict single-category deterministic classifier (From-only, never matches To:):
+ * 1. Personal SENT emails & Google Security Alerts -> General Inbox
+ * 2. Clubs Override (HIGHEST priority over Academic): word "club" in subject/sender/body or club events -> Clubs
+ * 3. Surveys (survey/questionnaire/feedback forms) -> Surveys
+ * 4. Volunteering (nss@rvce.edu.in, nccrvce@rvce.edu.in, or volunteering drives) -> Volunteering
+ * 5. Sports, Cultural (CARV/EVOKE/auditions/music/dance/fashion) & Fests (REACT/Synergy/Aeromania/Ignitron) -> General Inbox
+ * 6. Promotional blasts (Lenovo, Unlox, Corizo) & Unauthorized Spam (fake internships, rewards/lotteries, unauthorized scholarships, Gmail SPAM) -> Spam
+ * 7. Strict Academic (Google Classroom, MATLAB Grader, CIE/SEE, seating arrangements, syllabus, coursework, EL reviews, official academic circulars) -> Academic
  */
 export function matchMessageDeterministically(
   msg: {
     fromName?: string;
     fromEmail?: string;
-    replyTo?: string;
-    originalSender?: string;
-    to?: string;
     subject?: string;
     snippet?: string;
     bodyText?: string;
     labelIds?: string[];
   },
   rules: ClassificationRule[]
-): { rule: ClassificationRule; matchedEntry: string } | null {
-  const candidates = extractCandidateSenders(msg);
-  const hasVolSignal = hasStrongVolunteeringSignal(msg.subject, msg.snippet, msg.bodyText);
-  const hasSurveyWord = hasSurveySignal(msg);
-  const hasClubWord = hasClubSignal(msg);
+): DeterministicMatchResult | null {
+  const fromAddr = extractEmailAddress(msg.fromEmail || '');
+  const fromDomain = getDomainFromAddress(fromAddr);
+  const combinedText = decodeHtmlEntities(
+    `${msg.fromName || ''} ${msg.subject || ''} ${msg.snippet || ''} ${(msg.bodyText || '').slice(0, 1200)}`
+  );
 
-  const volunteeringRule = rules.find((r) => r.id === 'volunteering');
-  const surveysRule = rules.find((r) => r.id === 'surveys');
-  const clubsRule = rules.find((r) => r.id === 'clubs');
-  const academicRule = rules.find((r) => r.id === 'academic');
-  const spamRule = rules.find((r) => r.id === 'spam');
+  const volunteeringRule = rules.find((r) => r.id === 'volunteering') || null;
+  const surveysRule = rules.find((r) => r.id === 'surveys') || null;
+  const clubsRule = rules.find((r) => r.id === 'clubs') || null;
+  const academicRule = rules.find((r) => r.id === 'academic') || null;
+  const spamRule = rules.find((r) => r.id === 'spam') || null;
 
-  // 1. Exact Volunteering senders ALWAYS win first (nss@rvce.edu.in, nccrvce@rvce.edu.in)
-  if (volunteeringRule) {
-    for (const addr of candidates) {
-      const m = matchAddressAgainstRule(addr, volunteeringRule, false);
-      if (m) return { rule: volunteeringRule, matchedEntry: m };
-    }
+  // 1. Personal sent emails & Google Security Alerts ALWAYS go to General Inbox
+  if (msg.labelIds?.includes('SENT') && !msg.labelIds?.includes('INBOX')) {
+    return {
+      categoryId: 'general',
+      rule: null,
+      matchedEntry: 'personal sent email',
+    };
+  }
+  if (
+    fromAddr === 'no-reply@accounts.google.com' ||
+    (fromDomain.endsWith('google.com') && GOOGLE_SECURITY_ALERT_REGEX.test(combinedText))
+  ) {
+    return {
+      categoryId: 'general',
+      rule: null,
+      matchedEntry: 'Google security alert',
+    };
   }
 
-  // 2. Survey emails ALWAYS route to SURVEYS, separated from ACADEMIC MAILS
-  if (surveysRule) {
-    for (const addr of candidates) {
-      const m = matchAddressAgainstRule(addr, surveysRule, false);
-      if (m) return { rule: surveysRule, matchedEntry: m };
-    }
-    if (hasSurveyWord) {
-      return { rule: surveysRule, matchedEntry: 'keyword "survey"' };
-    }
-  }
-
-  // 3. Club emails (containing the word "club"/"clubs" or club sender addresses) ALWAYS route to CLUBS, never ACADEMIC MAILS
+  // 2. CLUBS OVERRIDE (Highest priority over Academic, even if sent/forwarded by faculty, HOD, Librarian, or Dean)
   if (clubsRule) {
-    for (const addr of candidates) {
-      const m = matchAddressAgainstRule(addr, clubsRule, false);
-      if (m) return { rule: clubsRule, matchedEntry: m };
+    if (fromAddr) {
+      const m = matchAddressAgainstRule(fromAddr, clubsRule, false);
+      if (m) return { categoryId: clubsRule.id, rule: clubsRule, matchedEntry: m };
     }
-    if (hasClubWord) {
-      return { rule: clubsRule, matchedEntry: 'keyword "club"' };
-    }
-  }
-
-  // 4. Exact email matches for Custom rules, Spam blocklist & Academic faculty directory
-  for (const rule of rules) {
-    if (rule.id === 'volunteering' || rule.id === 'surveys' || rule.id === 'clubs') continue;
-    for (const addr of candidates) {
-      const m = matchAddressAgainstRule(addr, rule, true);
-      if (m) {
-        // If a faculty/RVCE sender explicitly sends a volunteering call, let Gemini route it to VOLUNTEERING MAILS
-        if (rule.id === 'academic' && hasVolSignal) {
-          return null;
-        }
-        return { rule, matchedEntry: m };
-      }
+    if (hasClubSignal(msg)) {
+      return { categoryId: clubsRule.id, rule: clubsRule, matchedEntry: 'club override' };
     }
   }
 
-  // 5. Domain-level matches (e.g. mail.grader.mathworks.com, rvce.edu.in, rvei.edu.in, or user-added spam domains)
-  for (const rule of rules) {
-    if (rule.id === 'volunteering' || rule.id === 'surveys' || rule.id === 'clubs') continue;
-    for (const addr of candidates) {
-      const m = matchAddressAgainstRule(addr, rule, false);
-      if (m) {
-        if (rule.id === 'academic' && hasVolSignal) {
-          return null;
-        }
-        return { rule, matchedEntry: m };
-      }
+  // 3. SURVEYS (always separated from Academic)
+  if (surveysRule) {
+    if (fromAddr) {
+      const m = matchAddressAgainstRule(fromAddr, surveysRule, false);
+      if (m) return { categoryId: surveysRule.id, rule: surveysRule, matchedEntry: m };
+    }
+    if (hasSurveySignal(msg)) {
+      return { categoryId: surveysRule.id, rule: surveysRule, matchedEntry: 'survey signal' };
     }
   }
 
-  // 6. Institutional Google Group mailing lists in To: header (e.g. To: ec2026@rvce.edu.in)
-  if (academicRule && !hasVolSignal && !hasSurveyWord && !hasClubWord && msg.to) {
-    const toLower = msg.to.toLowerCase();
-    if (toLower.includes('@rvce.edu.in') || toLower.includes('@rvei.edu.in')) {
-      const subjectAndSnippet = `${msg.subject || ''} ${msg.snippet || ''}`;
-      if (
-        /\b(rvce|rvei|cie\b|see\s+exam|timetable|assignment|placement|circular|matlab|semester|syllabus|lab\s+manual|google\s+classroom|hod|dean|ctto)\b/i.test(
-          subjectAndSnippet
-        )
-      ) {
-        return { rule: academicRule, matchedEntry: 'rvce.edu.in campus notice' };
-      }
+  // 4. VOLUNTEERING (NSS, NCC, blood donation, community service drives)
+  if (volunteeringRule) {
+    if (fromAddr) {
+      const m = matchAddressAgainstRule(fromAddr, volunteeringRule, false);
+      if (m) return { categoryId: volunteeringRule.id, rule: volunteeringRule, matchedEntry: m };
+    }
+    if (hasStrongVolunteeringSignal(msg.subject, msg.snippet, msg.bodyText)) {
+      return {
+        categoryId: volunteeringRule.id,
+        rule: volunteeringRule,
+        matchedEntry: 'volunteering drive',
+      };
     }
   }
 
-  // 7. Spam from unauthorized senders (fake internships, rewards/lottery, unauthorized scholarships, scams, Gmail SPAM)
-  // Official emails from popular websites or verified .edu/.ac.in/.gov.in domains are protected from false spam tagging.
+  // 5. SPORTS, CULTURAL & FEST MAILS -> General Inbox (NEVER Academic)
+  if (hasSportsCulturalFestSignal(msg)) {
+    return {
+      categoryId: 'general',
+      rule: null,
+      matchedEntry: 'sports / cultural / fest mail',
+    };
+  }
+
+  // 6. PROMOTIONAL BLASTS (Lenovo, Unlox, Corizo) & SPAM
   if (spamRule) {
-    const isTrustedSite = candidates.some((addr) => isOfficialPopularWebsiteEmail(addr));
-    const isOfficialInstOrGov = candidates.some((addr) => isOfficialInstitutionalOrGovEmail(addr));
+    if (fromAddr) {
+      const m = matchAddressAgainstRule(fromAddr, spamRule, false);
+      if (m) return { categoryId: spamRule.id, rule: spamRule, matchedEntry: m };
+    }
+    if (
+      PROMOTIONAL_SPAM_BRANDS_REGEX.test(fromAddr) ||
+      PROMOTIONAL_SPAM_BRANDS_REGEX.test(`${msg.fromName || ''} ${msg.subject || ''}`)
+    ) {
+      return {
+        categoryId: spamRule.id,
+        rule: spamRule,
+        matchedEntry: 'promotional marketing blast',
+      };
+    }
+
+    const isTrustedSite = isOfficialPopularWebsiteEmail(fromAddr);
+    const isOfficialInstOrGov = isOfficialInstitutionalOrGovEmail(fromAddr);
 
     if (msg.labelIds?.includes('SPAM') && !isTrustedSite) {
-      return { rule: spamRule, matchedEntry: 'Gmail SPAM label' };
+      return { categoryId: spamRule.id, rule: spamRule, matchedEntry: 'Gmail SPAM label' };
     }
 
     if (!isTrustedSite && !isOfficialInstOrGov) {
-      const spamText = `${msg.subject || ''} ${msg.snippet || ''} ${(msg.bodyText || '').slice(0, 500)}`;
+      const spamText = decodeHtmlEntities(
+        `${msg.subject || ''} ${msg.snippet || ''} ${(msg.bodyText || '').slice(0, 500)}`
+      );
       if (OBVIOUS_SPAM_SIGNAL_REGEX.test(spamText)) {
-        return { rule: spamRule, matchedEntry: 'unauthorized reward/lottery/scam' };
+        return {
+          categoryId: spamRule.id,
+          rule: spamRule,
+          matchedEntry: 'unauthorized reward/lottery/scam',
+        };
       }
       if (UNAUTHORIZED_FAKE_OPPORTUNITY_SPAM_REGEX.test(spamText)) {
-        return { rule: spamRule, matchedEntry: 'unauthorized internship/scholarship/reward' };
+        return {
+          categoryId: spamRule.id,
+          rule: spamRule,
+          matchedEntry: 'unauthorized internship/scholarship/reward',
+        };
       }
+    }
+  }
+
+  // 7. STRICT ACADEMIC (ONLY coursework, CIE/SEE, seating arrangements, syllabus, Google Classroom, MATLAB Grader, EL reviews, official academic circulars)
+  if (academicRule) {
+    // Inherently academic From: platforms (MATLAB Grader, Google Classroom)
+    if (fromAddr) {
+      const m = matchAddressAgainstRule(fromAddr, academicRule, false);
+      if (m) return { categoryId: academicRule.id, rule: academicRule, matchedEntry: m };
+    }
+    if (hasStrictAcademicSignal(msg)) {
+      return {
+        categoryId: academicRule.id,
+        rule: academicRule,
+        matchedEntry: 'strict academic criteria',
+      };
+    }
+  }
+
+  // 8. Custom user-added rules (strictly From: address only)
+  for (const rule of rules) {
+    if (rule.isSystemDefault) continue;
+    if (fromAddr) {
+      const m = matchAddressAgainstRule(fromAddr, rule, false);
+      if (m) return { categoryId: rule.id, rule, matchedEntry: m };
     }
   }
 
@@ -1021,15 +1152,12 @@ export function matchMessageDeterministically(
 /**
  * Fast-path check: official emails from popular legitimate websites (GitHub, LinkedIn,
  * Google, Amazon, Coursera, etc.) that did not match any deterministic campus/club/survey/
- * volunteering rule and have no custom rule or feedback override can route directly to
- * General Inbox in 0ms without consuming Gemini API quota.
+ * volunteering/spam rule can route directly to General Inbox in 0ms without burning API quota.
  */
 export function canFastPathOfficialWebsiteToGeneral(
   msg: {
     fromName?: string;
     fromEmail?: string;
-    replyTo?: string;
-    originalSender?: string;
     subject?: string;
     snippet?: string;
     bodyText?: string;
@@ -1037,35 +1165,35 @@ export function canFastPathOfficialWebsiteToGeneral(
   rules: ClassificationRule[],
   feedbackExamples: TrainingFeedbackExample[] = []
 ): boolean {
-  const candidates = extractCandidateSenders(msg);
-  if (!candidates.some((addr) => isOfficialPopularWebsiteEmail(addr))) {
+  const fromAddr = extractEmailAddress(msg.fromEmail || '');
+  if (!isOfficialPopularWebsiteEmail(fromAddr)) {
     return false;
   }
 
-  // Never fast-path if the email has strong volunteering/survey/club signals
   if (
-    hasStrongVolunteeringSignal(msg.subject, msg.snippet, msg.bodyText) ||
+    hasClubSignal(msg) ||
     hasSurveySignal(msg) ||
-    hasClubSignal(msg)
+    hasStrongVolunteeringSignal(msg.subject, msg.snippet, msg.bodyText) ||
+    hasStrictAcademicSignal(msg) ||
+    PROMOTIONAL_SPAM_BRANDS_REGEX.test(`${msg.fromName || ''} ${fromAddr} ${msg.subject || ''}`)
   ) {
     return false;
   }
 
-  // Respect any user-corrected training example for this sender
-  const lowerCandidates = new Set(candidates.map((c) => c.toLowerCase()));
   if (
     feedbackExamples.some((ex) => {
       const exAddr = extractEmailAddress(ex.fromEmail || '');
-      return exAddr && lowerCandidates.has(exAddr);
+      return exAddr && exAddr === fromAddr;
     })
   ) {
     return false;
   }
 
-  // Respect any custom user-created rule keywords
   const customRules = rules.filter((r) => !r.isSystemDefault && r.keywords.length > 0);
   if (customRules.length > 0) {
-    const combined = `${msg.subject || ''} ${msg.snippet || ''} ${(msg.bodyText || '').slice(0, 400)}`.toLowerCase();
+    const combined = decodeHtmlEntities(
+      `${msg.subject || ''} ${msg.snippet || ''} ${(msg.bodyText || '').slice(0, 400)}`
+    ).toLowerCase();
     for (const rule of customRules) {
       if (rule.keywords.some((kw) => kw.trim() && combined.includes(kw.trim().toLowerCase()))) {
         return false;
@@ -1079,15 +1207,11 @@ export function canFastPathOfficialWebsiteToGeneral(
 /**
  * Zero-cost local fallback classifier used automatically whenever GEMINI_API_KEY is
  * unconfigured or Gemini's free-tier quota is temporarily saturated across campus.
- * Guarantees uninterrupted free sorting for all students and faculty.
  */
 export function classifyMessageLocallyFallback(
   msg: {
     fromName?: string;
     fromEmail?: string;
-    replyTo?: string;
-    originalSender?: string;
-    to?: string;
     subject?: string;
     snippet?: string;
     bodyText?: string;
@@ -1099,62 +1223,39 @@ export function classifyMessageLocallyFallback(
   const directMatch = matchMessageDeterministically(msg, rules);
   if (directMatch) {
     return {
-      categoryId: directMatch.rule.id,
+      categoryId: directMatch.categoryId,
       confidence: 1.0,
       matchedBy: 'directory',
-      reason: `Matched trained ${directMatch.rule.shortName} rule (${directMatch.matchedEntry}).`,
+      reason: directMatch.rule
+        ? `Matched ${directMatch.rule.shortName} (${directMatch.matchedEntry}).`
+        : `Routed to General Inbox (${directMatch.matchedEntry}).`,
     };
   }
 
-  const candidates = extractCandidateSenders(msg);
-  const lowerCandidates = new Set(candidates.map((c) => c.toLowerCase()));
-  const isTrustedSite = candidates.some((addr) => isOfficialPopularWebsiteEmail(addr));
-  const isOfficialInst = candidates.some((addr) => isOfficialInstitutionalOrGovEmail(addr));
+  const fromAddr = extractEmailAddress(msg.fromEmail || '');
+  const isTrustedSite = isOfficialPopularWebsiteEmail(fromAddr);
+  const isOfficialInst = isOfficialInstitutionalOrGovEmail(fromAddr);
 
-  // 1. Honor explicit user feedback examples for the same sender
-  for (let i = feedbackExamples.length - 1; i >= 0; i--) {
-    const ex = feedbackExamples[i];
-    const exAddr = extractEmailAddress(ex.fromEmail || '');
-    if (exAddr && lowerCandidates.has(exAddr)) {
-      const targetExists =
-        ex.assignedCategoryId === 'general' ||
-        rules.some((r) => r.id === ex.assignedCategoryId);
-      if (targetExists) {
-        return {
-          categoryId: ex.assignedCategoryId,
-          confidence: 0.92,
-          matchedBy: 'directory',
-          reason: 'Matched previous user-corrected sender feedback.',
-        };
-      }
-    }
-  }
-
-  // 2. Volunteering semantic fallback
-  const volunteeringRule = rules.find((r) => r.id === 'volunteering');
-  if (volunteeringRule && hasStrongVolunteeringSignal(msg.subject, msg.snippet, msg.bodyText)) {
-    return {
-      categoryId: volunteeringRule.id,
-      confidence: 0.88,
-      matchedBy: 'directory',
-      reason: 'Matched volunteering and community outreach keywords.',
-    };
-  }
-
-  // 3. Official popular websites always route cleanly to General Inbox
+  // Official popular websites route cleanly to General Inbox
   if (canFastPathOfficialWebsiteToGeneral(msg, rules, feedbackExamples)) {
     return {
       categoryId: 'general',
-      confidence: 0.95,
+      confidence: 0.96,
       matchedBy: 'directory',
       reason: 'Official email from a popular website routed to General Inbox.',
     };
   }
 
-  // 4. Keyword match across active rules (protecting trusted/official domains from Spam)
-  const combined = `${msg.subject || ''} ${msg.snippet || ''} ${(msg.bodyText || '').slice(0, 600)}`.toLowerCase();
+  // Keyword match across active rules (respecting spam & academic strictness)
+  const combined = decodeHtmlEntities(
+    `${msg.subject || ''} ${msg.snippet || ''} ${(msg.bodyText || '').slice(0, 600)}`
+  ).toLowerCase();
   for (const rule of rules) {
     if (rule.id === 'spam' && (isTrustedSite || isOfficialInst)) {
+      continue;
+    }
+    if (rule.id === 'academic') {
+      // Strict Academic already evaluated via hasStrictAcademicSignal above
       continue;
     }
     for (const rawKw of rule.keywords) {
@@ -1163,7 +1264,7 @@ export function classifyMessageLocallyFallback(
       if (combined.includes(kw)) {
         return {
           categoryId: rule.id,
-          confidence: 0.82,
+          confidence: 0.85,
           matchedBy: 'directory',
           reason: `Matched ${rule.shortName} keyword "${kw}".`,
         };
@@ -1173,7 +1274,7 @@ export function classifyMessageLocallyFallback(
 
   return {
     categoryId: 'general',
-    confidence: 0.72,
+    confidence: 0.78,
     matchedBy: 'directory',
     reason: 'Routed to General Inbox.',
   };
@@ -1199,11 +1300,9 @@ export function parseTrainingOrderLocallyFallback(
   const cleaned = instruction.trim();
   const lower = cleaned.toLowerCase();
 
-  // Extract emails and domains mentioned in the prompt
   const emailMatches = cleaned.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) ?? [];
   const senders = Array.from(new Set(emailMatches.map((e) => e.toLowerCase())));
 
-  // Extract quoted phrases as keywords
   const quotedKeywords: string[] = [];
   const quoteRegex = /["']([^"']{2,48})["']/g;
   let qMatch: RegExpExecArray | null;
@@ -1211,7 +1310,6 @@ export function parseTrainingOrderLocallyFallback(
     if (qMatch[1]) quotedKeywords.push(qMatch[1].trim().toLowerCase());
   }
 
-  // Detect if targeting an existing mailbox
   const matchedExisting = existingRules.find(
     (r) =>
       lower.includes(r.name.toLowerCase()) ||
@@ -1237,10 +1335,11 @@ export function parseTrainingOrderLocallyFallback(
   const rawName = (labelMatch?.[1] || 'CUSTOM MAILS').trim();
   const shortName = rawName.replace(/\s+mails?$/i, '').trim() || 'Custom';
   const name = rawName.toUpperCase();
-  const targetRuleId = shortName
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '') || 'custom';
+  const targetRuleId =
+    shortName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') || 'custom';
 
   return {
     action: 'create_new',
@@ -1260,6 +1359,6 @@ export function parseTrainingOrderLocallyFallback(
 export function matchSenderToRule(
   fromEmail: string,
   rules: ClassificationRule[]
-): { rule: ClassificationRule; matchedEntry: string } | null {
+): DeterministicMatchResult | null {
   return matchMessageDeterministically({ fromEmail }, rules);
 }

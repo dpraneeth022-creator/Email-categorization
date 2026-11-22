@@ -1,8 +1,9 @@
 import { DEFAULT_CLASSIFICATION_RULES } from '../shared/classifierRules';
 import type { ClassificationRule, TrainingFeedbackExample } from '../shared/types';
 
-const RULES_STORAGE_KEY = 'nexamail_classification_rules_v6';
+const RULES_STORAGE_KEY = 'nexamail_classification_rules_v7';
 const LEGACY_RULES_KEYS = [
+  'nexamail_classification_rules_v6',
   'nexamail_classification_rules_v5',
   'nexamail_classification_rules_v4',
   'nexamail_classification_rules_v3',
@@ -21,33 +22,21 @@ export function loadStoredRules(): ClassificationRule[] {
       }
     }
 
-    // Migrate custom rules and user-added senders while refreshing system default definitions
+    // Migrate custom rules cleanly while adopting the strict v7 system default rules
     for (const legacyKey of LEGACY_RULES_KEYS) {
       const legacyRaw = window.localStorage.getItem(legacyKey);
       if (!legacyRaw) continue;
       const legacy = JSON.parse(legacyRaw) as ClassificationRule[];
       if (Array.isArray(legacy) && legacy.length > 0) {
         const defaultIds = new Set(DEFAULT_CLASSIFICATION_RULES.map((r) => r.id));
-        const upgradedDefaults = DEFAULT_CLASSIFICATION_RULES.map((defRule) => {
-          const prev = legacy.find((r) => r.id === defRule.id);
-          if (!prev) return defRule;
-          return {
-            ...defRule,
-            senders: Array.from(new Set([...defRule.senders, ...prev.senders])),
-            // For spam, adopt the updated precise keywords (drops legacy broad newsletter keywords like "unsubscribe")
-            keywords:
-              defRule.id === 'spam'
-                ? [...defRule.keywords]
-                : Array.from(new Set([...defRule.keywords, ...prev.keywords])),
-          };
-        });
         const customRules = legacy.filter((r) => !defaultIds.has(r.id));
-        const merged = [...upgradedDefaults, ...customRules];
+        const merged = [...DEFAULT_CLASSIFICATION_RULES, ...customRules];
         saveStoredRules(merged);
         return merged;
       }
     }
 
+    saveStoredRules(DEFAULT_CLASSIFICATION_RULES);
     return DEFAULT_CLASSIFICATION_RULES;
   } catch {
     return DEFAULT_CLASSIFICATION_RULES;

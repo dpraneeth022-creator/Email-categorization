@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AuthLanding } from './components/AuthLanding';
 import { MailWorkspace } from './components/MailWorkspace';
-import { TrainingStudio } from './components/TrainingStudio';
 import {
   checkGoogleRedirectResult,
   getGmailAccessToken,
@@ -10,26 +9,26 @@ import {
   initGoogleAuth,
 } from './lib/firebaseAuth';
 import {
-  loadStoredFeedback,
-  loadStoredRules,
-  resetStoredRules,
-  saveStoredFeedback,
-  saveStoredRules,
-} from './lib/storage';
+  loadCachedMailbox,
+  saveCachedMessages,
+  saveCachedMeta,
+} from './lib/mailCache';
+import { loadStoredFeedback, loadStoredRules } from './lib/storage';
 import {
   DEFAULT_ALLOWED_CAMPUS_DOMAINS,
   buildCampusRestrictionError,
   isAllowedCampusEmail,
 } from './shared/campusPolicy';
 import {
+  CURRENT_RULES_VERSION,
   canFastPathOfficialWebsiteToGeneral,
   classifyMessageLocallyFallback,
+  decodeHtmlEntities,
   matchMessageDeterministically,
 } from './shared/classifierRules';
 import type {
   ClassificationRule,
   ConnectedAccount,
-  ImapCredentials,
   MailAttachment,
   MailClassification,
   MailMessage,
@@ -46,10 +45,87 @@ export interface SyncProgressState {
   phaseLabel: string;
 }
 
-type SyncCursor =
-  | { provider: 'gmail'; pageToken: string; query?: string }
-  | { provider: 'outlook'; nextLink: string }
-  | { provider: 'imap'; beforeSeq: number };
+const CLIENT_BACKOFF_DELAYS_MS = [2000, 4000, 8000];
+const RATE_LIMIT_FRIENDLY_MESSAGE =
+  'Sync paused briefly due to Gmail rate limits — retrying automatically.';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeMessageText(msg: MailMessage): MailMessage {
+  return {
+    ...msg,
+    fromName: decodeHtmlEntities(msg.fromName || msg.fromEmail || ''),
+    subject: decodeHtmlEntities(msg.subject || '(No Subject)'),
+    snippet: decodeHtmlEntities(msg.snippet || ''),
+  };
+}
+
+/**
+ * Strictly deduplicates emails by message ID and thread ID so identical emails
+ * never appear twice in a row. Preserves hydrated full HTML bodies/attachments
+ * and keeps the newest message per thread sorted newest-first.
+ */
+function deduplicateAndSortMessages(list: MailMessage[]): MailMessage[] {
+  const byId = new Map<string, MailMessage>();
+  for (const raw of list) {
+    if (!raw?.id) continue;
+    const msg = normalizeMessageText(raw);
+    const existing = byId.get(msg.id);
+    if (!existing) {
+      byId.set(msg.id, msg);
+    } else {
+      byId.set(msg.id, {
+        ...existing,
+        ...msg,
+        bodyHtml: msg.bodyHtml || existing.bodyHtml,
+        bodyText: msg.fullBodyLoaded ? msg.bodyText : existing.bodyText || msg.bodyText,
+        attachments: msg.attachments?.length ? msg.attachments : existing.attachments,
+        fullBodyLoaded: Boolean(msg.fullBodyLoaded || existing.fullBodyLoaded),
+        classification: msg.classification || existing.classification,
+      });
+    }
+  }
+
+  // Deduplicate by threadId so repeated thread messages do not appear twice in a row
+  const byThread = new Map<string, MailMessage>();
+  for (const msg of byId.values()) {
+    const threadKey = msg.threadId ? `thread:${msg.threadId}` : `id:${msg.id}`;
+    const existing = byThread.get(threadKey);
+    if (!existing) {
+      byThread.set(threadKey, msg);
+      continue;
+    }
+    const existingTime = Date.parse(existing.dateIso) || 0;
+    const incomingTime = Date.parse(msg.dateIso) || 0;
+    const newer = incomingTime >= existingTime ? msg : existing;
+    const older = incomingTime >= existingTime ? existing : msg;
+    byThread.set(threadKey, {
+      ...newer,
+      bodyHtml: newer.bodyHtml || older.bodyHtml,
+      attachments: newer.attachments?.length ? newer.attachments : older.attachments,
+      fullBodyLoaded: Boolean(newer.fullBodyLoaded || older.fullBodyLoaded),
+    });
+  }
+
+  return Array.from(byThread.values()).sort((a, b) => {
+    const timeA = Date.parse(a.dateIso) || 0;
+    const timeB = Date.parse(b.dateIso) || 0;
+    return timeB - timeA;
+  });
+}
+
+function triggerBlobDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || 'attachment';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
 
 export default function App() {
   const [account, setAccount] = useState<ConnectedAccount | null>(null);
@@ -57,18 +133,14 @@ export default function App() {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
-  // Strictly in-memory credentials/tokens (never stored in localStorage/sessionStorage)
-  const thirdPartyTokenRef = useRef<string | null>(null);
-  const imapCredentialsRef = useRef<ImapCredentials | null>(null);
-
-  const [rules, setRules] = useState<ClassificationRule[]>(() => loadStoredRules());
-  const [feedbackExamples, setFeedbackExamples] = useState<TrainingFeedbackExample[]>(() =>
-    loadStoredFeedback()
-  );
+  const [rules] = useState<ClassificationRule[]>(() => loadStoredRules());
+  const [feedbackExamples] = useState<TrainingFeedbackExample[]>(() => loadStoredFeedback());
 
   const [messages, setMessages] = useState<MailMessage[]>([]);
   const [isFetchingMail, setIsFetchingMail] = useState(false);
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
   const [isClassifying, setIsClassifying] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [loadingFullMessageId, setLoadingFullMessageId] = useState<string | null>(null);
 
@@ -81,16 +153,13 @@ export default function App() {
     phaseLabel: '',
   });
 
-  const [showTrainingView, setShowTrainingView] = useState(false);
-  const [trainingInitialTab, setTrainingInitialTab] = useState<'rules' | 'order' | 'test'>('rules');
-
-  // Cancellation & pagination refs for streaming full-mailbox sync
   const syncRunIdRef = useRef(0);
-  const nextCursorRef = useRef<SyncCursor | null>(null);
+  const nextPageTokenRef = useRef<string | null>(null);
   const totalEstimateRef = useRef<number | null>(null);
   const fullBodyInFlightRef = useRef<Set<string>>(new Set());
 
-  // Keep latest rules & feedback accessible inside mount-only auth listeners
+  const accountRef = useRef<ConnectedAccount | null>(account);
+  accountRef.current = account;
   const rulesRef = useRef(rules);
   rulesRef.current = rules;
   const feedbackRef = useRef(feedbackExamples);
@@ -103,7 +172,7 @@ export default function App() {
       ? providerStatus.campus.allowedDomains
       : DEFAULT_ALLOWED_CAMPUS_DOMAINS;
 
-  // Load provider configuration status on mount
+  // Load campus domain config on mount
   useEffect(() => {
     fetch('/api/auth/providers')
       .then((res) => (res.ok ? res.json() : null))
@@ -115,31 +184,40 @@ export default function App() {
       });
   }, []);
 
-  // Instant 0ms local directory classification + chunked parallel Gemini classification for any number of emails
+  /**
+   * Classifies messages in 0ms deterministically + calls campus-authenticated Gemini batcher
+   * for ambiguous emails, then persists updated categories directly to IndexedDB.
+   */
   const classifyMessages = useCallback(
     async (
       targetMessages: MailMessage[],
       activeRules: ClassificationRule[],
       activeFeedback: TrainingFeedbackExample[],
-      options?: { runId?: number; silentErrors?: boolean }
-    ): Promise<number> => {
-      if (targetMessages.length === 0) return 0;
+      options?: {
+        runId?: number;
+        accountEmail?: string;
+        tokenOverride?: string;
+      }
+    ): Promise<Record<string, MailClassification>> => {
+      if (targetMessages.length === 0) return {};
 
-      // Step 1: Instant 0ms deterministic directory & popular-website fast-path in browser (zero API cost)
-      const instantMatches: Record<string, MailClassification> = {};
+      const allResults: Record<string, MailClassification> = {};
       const unmatchedMessages: MailMessage[] = [];
 
+      // Step 1: Instant 0ms strict deterministic + popular-website fast-path
       for (const msg of targetMessages) {
         const directMatch = matchMessageDeterministically(msg, activeRules);
         if (directMatch) {
-          instantMatches[msg.id] = {
-            categoryId: directMatch.rule.id,
+          allResults[msg.id] = {
+            categoryId: directMatch.categoryId,
             confidence: 1.0,
             matchedBy: 'directory',
-            reason: `Matched trained ${directMatch.rule.shortName} rule (${directMatch.matchedEntry}).`,
+            reason: directMatch.rule
+              ? `Matched ${directMatch.rule.shortName} (${directMatch.matchedEntry}).`
+              : `Routed to General Inbox (${directMatch.matchedEntry}).`,
           };
         } else if (canFastPathOfficialWebsiteToGeneral(msg, activeRules, activeFeedback)) {
-          instantMatches[msg.id] = {
+          allResults[msg.id] = {
             categoryId: 'general',
             confidence: 0.96,
             matchedBy: 'directory',
@@ -150,35 +228,57 @@ export default function App() {
         }
       }
 
-      let classifiedNow = Object.keys(instantMatches).length;
+      const applyAndPersist = (
+        partial: Record<string, MailClassification>,
+        sourceList: MailMessage[]
+      ) => {
+        if (Object.keys(partial).length === 0) return;
 
-      if (classifiedNow > 0) {
+        // Build persisted snapshot synchronously (never rely on React's deferred setState updater to populate an array)
+        const baseById = new Map<string, MailMessage>();
+        for (const msg of messagesRef.current) baseById.set(msg.id, msg);
+        for (const msg of sourceList) {
+          if (!baseById.has(msg.id)) baseById.set(msg.id, msg);
+        }
+
+        const updatedForCache: MailMessage[] = [];
+        for (const [id, nextCls] of Object.entries(partial)) {
+          const base = baseById.get(id);
+          if (base) {
+            updatedForCache.push({ ...base, classification: nextCls });
+          }
+        }
+
         setMessages((prev) =>
-          prev.map((msg) => ({
-            ...msg,
-            classification: instantMatches[msg.id] || msg.classification,
-          }))
+          prev.map((msg) => {
+            const nextCls = partial[msg.id];
+            return nextCls ? { ...msg, classification: nextCls } : msg;
+          })
         );
-      }
 
-      if (unmatchedMessages.length === 0) return classifiedNow;
+        const acctEmail = options?.accountEmail || accountRef.current?.email;
+        if (acctEmail && updatedForCache.length > 0) {
+          void saveCachedMessages(acctEmail, updatedForCache);
+        }
+      };
 
-      // Step 2: Send remaining emails in fast 75-message chunks to campus-authenticated classifier
+      applyAndPersist(allResults, targetMessages);
+
+      if (unmatchedMessages.length === 0) return allResults;
+
+      // Step 2: Send remaining ambiguous emails in chunks to server AI classifier (with zero-cost local fallback)
       setIsClassifying(true);
-      if (!options?.silentErrors) {
-        setWorkspaceError(null);
-      }
-
       try {
-        const gmailToken = getGmailAccessToken();
+        const gmailToken = options?.tokenOverride || getGmailAccessToken();
         const chunkSize = 75;
+
         for (let i = 0; i < unmatchedMessages.length; i += chunkSize) {
           if (options?.runId !== undefined && syncRunIdRef.current !== options.runId) {
             break;
           }
 
           const slice = unmatchedMessages.slice(i, i + chunkSize);
-          let classMap: Record<string, MailClassification> = {};
+          let chunkMap: Record<string, MailClassification> = {};
 
           if (gmailToken) {
             const compactPayload = slice.map((m) => ({
@@ -186,8 +286,6 @@ export default function App() {
               provider: m.provider,
               fromName: m.fromName,
               fromEmail: m.fromEmail,
-              replyTo: m.replyTo,
-              originalSender: m.originalSender,
               to: m.to,
               subject: m.subject,
               snippet: m.snippet.slice(0, 180),
@@ -212,319 +310,451 @@ export default function App() {
               });
               const data = await res.json();
               if (res.ok && data?.classifications) {
-                classMap = data.classifications as Record<string, MailClassification>;
+                chunkMap = data.classifications as Record<string, MailClassification>;
               } else {
                 for (const m of slice) {
-                  classMap[m.id] = classifyMessageLocallyFallback(m, activeRules, activeFeedback);
+                  chunkMap[m.id] = classifyMessageLocallyFallback(m, activeRules, activeFeedback);
                 }
               }
             } catch {
               for (const m of slice) {
-                classMap[m.id] = classifyMessageLocallyFallback(m, activeRules, activeFeedback);
+                chunkMap[m.id] = classifyMessageLocallyFallback(m, activeRules, activeFeedback);
               }
             }
           } else {
             for (const m of slice) {
-              classMap[m.id] = classifyMessageLocallyFallback(m, activeRules, activeFeedback);
+              chunkMap[m.id] = classifyMessageLocallyFallback(m, activeRules, activeFeedback);
             }
           }
 
-          classifiedNow += Object.keys(classMap).length;
-
-          setMessages((prev) =>
-            prev.map((msg) => ({
-              ...msg,
-              classification: classMap[msg.id] || msg.classification,
-            }))
-          );
-
-          if (options?.runId === undefined) {
-            setSyncProgress((prev) => ({
-              ...prev,
-              classifiedCount: prev.classifiedCount + Object.keys(classMap).length,
-            }));
-          }
-        }
-      } catch (err) {
-        if (!options?.silentErrors) {
-          setWorkspaceError(
-            err instanceof Error ? err.message : 'Unable to classify emails right now.'
-          );
+          Object.assign(allResults, chunkMap);
+          applyAndPersist(chunkMap, slice);
         }
       } finally {
         setIsClassifying(false);
       }
 
-      return classifiedNow;
+      return allResults;
     },
     []
   );
 
-  // Stream & categorize EVERY email in the connected mailbox page-by-page (100 emails/page)
-  const fetchAndClassifyMail = useCallback(
+  /**
+   * Calls POST /api/gmail/sync with automatic exponential backoff (2s, 4s, 8s) on 403/429 rate limits,
+   * displaying a friendly status notice instead of raw Gmail API project numbers.
+   */
+  const requestGmailSyncPageWithBackoff = useCallback(
+    async (
+      accessToken: string,
+      payload: {
+        maxResults: number;
+        pageToken?: string;
+        excludeIds: string[];
+      },
+      runId: number
+    ): Promise<{
+      messages: MailMessage[];
+      nextPageToken: string | null;
+      resultSizeEstimate: number;
+      skippedCachedCount: number;
+      allPageCached: boolean;
+      rateLimited: boolean;
+    }> => {
+      let attempt = 0;
+
+      while (true) {
+        if (syncRunIdRef.current !== runId) {
+          return {
+            messages: [],
+            nextPageToken: payload.pageToken || null,
+            resultSizeEstimate: 0,
+            skippedCachedCount: 0,
+            allPageCached: false,
+            rateLimited: false,
+          };
+        }
+
+        const res = await fetch('/api/gmail/sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify(payload),
+        });
+
+        const rawText = await res.text();
+        let data: {
+          messages?: MailMessage[];
+          nextPageToken?: string | null;
+          resultSizeEstimate?: number;
+          skippedCachedCount?: number;
+          allPageCached?: boolean;
+          rateLimited?: boolean;
+          statusNotice?: string;
+          code?: string;
+          error?: string;
+        } = {};
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          throw new Error('Unable to reach Gmail right now. Please try syncing again.');
+        }
+
+        const isRateLimited =
+          res.status === 429 || data.code === 'GMAIL_RATE_LIMITED' || Boolean(data.rateLimited && !res.ok);
+
+        if (isRateLimited) {
+          setStatusMessage(RATE_LIMIT_FRIENDLY_MESSAGE);
+          if (attempt < CLIENT_BACKOFF_DELAYS_MS.length) {
+            await sleep(CLIENT_BACKOFF_DELAYS_MS[attempt]);
+            attempt += 1;
+            continue;
+          }
+          // Stop gracefully without showing raw errors; user can continue syncing shortly
+          return {
+            messages: Array.isArray(data.messages) ? data.messages : [],
+            nextPageToken: payload.pageToken || null,
+            resultSizeEstimate: data.resultSizeEstimate || 0,
+            skippedCachedCount: data.skippedCachedCount || 0,
+            allPageCached: false,
+            rateLimited: true,
+          };
+        }
+
+        if (!res.ok) {
+          throw new Error(
+            data.error || 'Unable to sync Gmail right now. Please try again shortly.'
+          );
+        }
+
+        if (data.statusNotice) {
+          setStatusMessage(data.statusNotice);
+        } else {
+          setStatusMessage(null);
+        }
+
+        return {
+          messages: Array.isArray(data.messages) ? data.messages : [],
+          nextPageToken: data.nextPageToken || null,
+          resultSizeEstimate: data.resultSizeEstimate || 0,
+          skippedCachedCount: data.skippedCachedCount || 0,
+          allPageCached: Boolean(data.allPageCached),
+          rateLimited: Boolean(data.rateLimited),
+        };
+      }
+    },
+    []
+  );
+
+  /**
+   * Incremental Sync Inbox:
+   * 1. Immediately displays cached emails from IndexedDB (0ms load) and re-runs strict rules on cached emails.
+   * 2. Fetches ONLY uncached new emails from Gmail in metadata-first mode (skipping cached IDs).
+   * 3. Automatically classifies new emails and persists everything to IndexedDB.
+   */
+  const syncInbox = useCallback(
     async (
       connected: ConnectedAccount,
       options?: {
         tokenOverride?: string;
-        imapOverride?: ImapCredentials;
-        rulesOverride?: ClassificationRule[];
-        feedbackOverride?: TrainingFeedbackExample[];
-        gmailQuery?: string;
-        resume?: boolean;
+        loadOlderOnly?: boolean;
+        hydrateCacheFirst?: boolean;
       }
     ): Promise<boolean> => {
       const runId = ++syncRunIdRef.current;
-      const isResume = Boolean(options?.resume && nextCursorRef.current);
+      const isLoadOlder = Boolean(options?.loadOlderOnly);
 
-      setIsFetchingMail(true);
+      if (isLoadOlder) {
+        setIsLoadingOlder(true);
+      } else {
+        setIsFetchingMail(true);
+      }
       setWorkspaceError(null);
+      setStatusMessage(null);
 
-      const activeRules = options?.rulesOverride || rulesRef.current;
-      const activeFeedback = options?.feedbackOverride || feedbackRef.current;
-
-      if (connected.provider === 'import') {
-        try {
-          await classifyMessages(messagesRef.current, activeRules, activeFeedback, { runId });
-          return true;
-        } finally {
-          setIsFetchingMail(false);
-        }
-      }
-
-      if (connected.provider === 'yahoo') {
-        setMessages([]);
-        setWorkspaceError(
-          'Yahoo OAuth connected. To read your Yahoo inbox directly, sign out and connect via the Any Email (IMAP) tab with a Yahoo App Password.'
-        );
-        setIsFetchingMail(false);
-        return true;
-      }
-
-      let totalFetched = isResume ? messagesRef.current.length : 0;
-      let totalClassified = isResume
-        ? messagesRef.current.filter((m) => Boolean(m.classification)).length
-        : 0;
-      let totalEstimate: number | null = isResume ? totalEstimateRef.current : null;
-      const seenIds = new Set<string>(isResume ? messagesRef.current.map((m) => m.id) : []);
-
-      let cursor: SyncCursor | null = isResume ? nextCursorRef.current : null;
-      let isFirstPage = !isResume;
-
-      if (!isResume) {
-        nextCursorRef.current = null;
-        totalEstimateRef.current = null;
-        setMessages([]);
-      }
-
-      setSyncProgress({
-        isRunning: true,
-        fetchedCount: totalFetched,
-        classifiedCount: totalClassified,
-        totalEstimate,
-        hasMore: true,
-        phaseLabel: options?.gmailQuery ? 'Syncing RVCE & volunteering mail' : 'Syncing all mail',
-      });
+      const activeRules = rulesRef.current;
+      const activeFeedback = feedbackRef.current;
 
       try {
-        while (syncRunIdRef.current === runId) {
-          let pageMessages: MailMessage[] = [];
-          let nextCursor: SyncCursor | null = null;
+        let currentMessages = messagesRef.current;
+        let cachedIds = new Set<string>(currentMessages.map((m) => m.id));
 
-          if (connected.provider === 'imap') {
-            const creds = options?.imapOverride || imapCredentialsRef.current;
-            if (!creds) {
-              throw new Error('IMAP session credentials are unavailable. Please reconnect.');
+        // Instant IndexedDB load + automatic strict re-classification of existing cached emails
+        if (options?.hydrateCacheFirst || (!isLoadOlder && currentMessages.length === 0)) {
+          const { messages: cachedList, meta } = await loadCachedMailbox(connected.email);
+          if (syncRunIdRef.current !== runId) return false;
+
+          if (cachedList.length > 0) {
+            const dedupedCached = deduplicateAndSortMessages(cachedList);
+            currentMessages = dedupedCached;
+            cachedIds = new Set(dedupedCached.map((m) => m.id));
+            setMessages(dedupedCached);
+
+            if (meta?.nextPageToken && !nextPageTokenRef.current) {
+              nextPageTokenRef.current = meta.nextPageToken;
             }
-            const beforeSeq = cursor?.provider === 'imap' ? cursor.beforeSeq : undefined;
-            const res = await fetch('/api/imap/messages', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                email: creds.email,
-                password: creds.password,
-                host: creds.host,
-                port: creds.port,
-                maxResults: 100,
-                beforeSeq,
-              }),
+            if (meta?.totalEstimate && !totalEstimateRef.current) {
+              totalEstimateRef.current = meta.totalEstimate;
+            }
+
+            setSyncProgress({
+              isRunning: true,
+              fetchedCount: dedupedCached.length,
+              classifiedCount: dedupedCached.filter((m) => Boolean(m.classification)).length,
+              totalEstimate: totalEstimateRef.current,
+              hasMore: Boolean(nextPageTokenRef.current),
+              phaseLabel: 'Checking for new emails',
             });
-            const data = await res.json();
-            if (!res.ok) {
-              throw new Error(data.error || 'Failed to fetch emails via IMAP.');
-            }
-            pageMessages = Array.isArray(data.messages) ? data.messages : [];
-            if (typeof data.totalExists === 'number' && data.totalExists > 0) {
-              totalEstimate = data.totalExists;
-            }
-            if (typeof data.nextBeforeSeq === 'number' && data.nextBeforeSeq > 1) {
-              nextCursor = { provider: 'imap', beforeSeq: data.nextBeforeSeq };
-            }
-          } else {
-            const accessToken =
-              options?.tokenOverride ||
-              (connected.provider === 'gmail' ? getGmailAccessToken() : thirdPartyTokenRef.current);
 
-            if (!accessToken) {
-              throw new Error('Your session token is unavailable. Click Re-authorize Gmail.');
-            }
+            // Re-run updated strict categorization rules on all cached emails immediately
+            const needsRuleUpgrade = meta?.rulesVersion !== CURRENT_RULES_VERSION;
+            const emailsToReclassify = needsRuleUpgrade
+              ? dedupedCached
+              : dedupedCached.filter((m) => !m.classification);
 
-            let endpoint = '';
-            if (connected.provider === 'gmail') {
-              const gmailParams = new URLSearchParams({
-                maxResults: '100',
-                mode: 'metadata',
+            if (emailsToReclassify.length > 0) {
+              await classifyMessages(emailsToReclassify, activeRules, activeFeedback, {
+                runId,
+                accountEmail: connected.email,
+                tokenOverride: options?.tokenOverride,
               });
-              const activeQuery =
-                cursor?.provider === 'gmail' ? cursor.query : options?.gmailQuery;
-              if (activeQuery) {
-                gmailParams.set('q', activeQuery);
-              }
-              if (cursor?.provider === 'gmail' && cursor.pageToken) {
-                gmailParams.set('pageToken', cursor.pageToken);
-              }
-              endpoint = `/api/gmail/messages?${gmailParams.toString()}`;
-            } else {
-              const outlookParams = new URLSearchParams({ maxResults: '100' });
-              if (cursor?.provider === 'outlook' && cursor.nextLink) {
-                outlookParams.set('nextLink', cursor.nextLink);
-              }
-              endpoint = `/api/outlook/messages?${outlookParams.toString()}`;
-            }
-
-            const res = await fetch(endpoint, {
-              headers: { Authorization: `Bearer ${accessToken}` },
-            });
-
-            const rawText = await res.text();
-            let data: {
-              messages?: MailMessage[];
-              nextPageToken?: string | null;
-              nextLink?: string | null;
-              resultSizeEstimate?: number;
-              error?: string;
-            } = {};
-            try {
-              data = JSON.parse(rawText);
-            } catch {
-              throw new Error(`Unexpected response from mail server (${res.status}).`);
-            }
-
-            if (!res.ok) {
-              throw new Error(data.error || 'Failed to load messages from your mail provider.');
-            }
-
-            pageMessages = Array.isArray(data.messages) ? data.messages : [];
-
-            if (connected.provider === 'gmail') {
-              if (isFirstPage && typeof data.resultSizeEstimate === 'number') {
-                totalEstimate = data.resultSizeEstimate;
-              }
-              if (data.nextPageToken) {
-                nextCursor = {
-                  provider: 'gmail',
-                  pageToken: data.nextPageToken,
-                  query: cursor?.provider === 'gmail' ? cursor.query : options?.gmailQuery,
-                };
-              }
-            } else if (connected.provider === 'outlook' && data.nextLink) {
-              nextCursor = { provider: 'outlook', nextLink: data.nextLink };
+              await saveCachedMeta({
+                accountEmail: connected.email,
+                nextPageToken: nextPageTokenRef.current,
+                totalEstimate: totalEstimateRef.current,
+                rulesVersion: CURRENT_RULES_VERSION,
+                lastSyncedAt: Date.now(),
+              });
             }
           }
+        }
 
-          if (syncRunIdRef.current !== runId) break;
-
-          // Deduplicate and merge new page immediately into inbox state
-          const freshMessages = pageMessages.filter((m) => {
-            if (seenIds.has(m.id)) return false;
-            seenIds.add(m.id);
-            return true;
-          });
-
-          if (freshMessages.length > 0) {
-            totalFetched += freshMessages.length;
-            setMessages((prev) => (isFirstPage ? freshMessages : [...prev, ...freshMessages]));
-          }
-
-          isFirstPage = false;
-          nextCursorRef.current = nextCursor;
-
-          setSyncProgress({
-            isRunning: true,
-            fetchedCount: totalFetched,
-            classifiedCount: totalClassified,
-            totalEstimate: totalEstimate ? Math.max(totalEstimate, totalFetched) : null,
-            hasMore: Boolean(nextCursor),
-            phaseLabel: 'Categorizing mail',
-          });
-
-          // Classify this page right away so folder counts climb live
-          if (freshMessages.length > 0) {
-            const newlyClassified = await classifyMessages(
-              freshMessages,
-              rulesRef.current,
-              feedbackRef.current,
-              { runId, silentErrors: true }
+        let accessToken = options?.tokenOverride || getGmailAccessToken();
+        if (!accessToken) {
+          // User clicked Sync Inbox / Load Older Mail after a page reload from IndexedDB cache:
+          // refresh the in-memory Gmail OAuth token cleanly via Google popup
+          try {
+            const refreshed = await googleSignIn(false, allowedDomainsRef.current);
+            accessToken = refreshed?.accessToken || getGmailAccessToken();
+          } catch (authErr) {
+            throw new Error(
+              authErr instanceof Error
+                ? authErr.message
+                : 'Sign in with your RVCE Google account to sync new emails.'
             );
-            totalClassified += newlyClassified;
+          }
+        }
+        if (!accessToken) {
+          throw new Error('Your Gmail session expired. Click Re-authorize Gmail to reconnect.');
+        }
+
+        if (isLoadOlder) {
+          // Fetch the next older page using saved pagination token
+          const pageToken = nextPageTokenRef.current;
+          if (!pageToken) {
+            setSyncProgress((prev) => ({ ...prev, hasMore: false, isRunning: false }));
+            return true;
           }
 
-          if (syncRunIdRef.current !== runId) break;
+          const page = await requestGmailSyncPageWithBackoff(
+            accessToken,
+            {
+              maxResults: 60,
+              pageToken,
+              excludeIds: Array.from(cachedIds),
+            },
+            runId
+          );
 
-          totalEstimateRef.current = totalEstimate ? Math.max(totalEstimate, totalFetched) : null;
-          setSyncProgress({
-            isRunning: Boolean(nextCursor),
-            fetchedCount: totalFetched,
-            classifiedCount: totalClassified,
+          if (syncRunIdRef.current !== runId) return false;
+
+          nextPageTokenRef.current = page.nextPageToken;
+          if (page.resultSizeEstimate > 0) {
+            totalEstimateRef.current = Math.max(
+              totalEstimateRef.current || 0,
+              page.resultSizeEstimate
+            );
+          }
+
+          const freshMessages = page.messages.filter((m) => !cachedIds.has(m.id));
+          if (freshMessages.length > 0) {
+            const merged = deduplicateAndSortMessages([...messagesRef.current, ...freshMessages]);
+            setMessages(merged);
+            await saveCachedMessages(connected.email, freshMessages);
+            await classifyMessages(freshMessages, activeRules, activeFeedback, {
+              runId,
+              accountEmail: connected.email,
+              tokenOverride: accessToken,
+            });
+          }
+
+          await saveCachedMeta({
+            accountEmail: connected.email,
+            nextPageToken: nextPageTokenRef.current,
             totalEstimate: totalEstimateRef.current,
-            hasMore: Boolean(nextCursor),
-            phaseLabel: nextCursor ? 'Loading older mail' : 'All mail categorized',
+            rulesVersion: CURRENT_RULES_VERSION,
+            lastSyncedAt: Date.now(),
           });
 
-          if (!nextCursor) {
+          setSyncProgress({
+            isRunning: false,
+            fetchedCount: messagesRef.current.length,
+            classifiedCount: messagesRef.current.filter((m) => Boolean(m.classification)).length,
+            totalEstimate: totalEstimateRef.current,
+            hasMore: Boolean(nextPageTokenRef.current),
+            phaseLabel: '',
+          });
+
+          return true;
+        }
+
+        // Incremental Sync Inbox: walk from newest page until we hit already-cached pages (or 2 initial pages on first-ever load)
+        const isInitialEmptySync = cachedIds.size === 0;
+        const maxIncrementalPages = isInitialEmptySync ? 2 : 4;
+        let pageToken: string | undefined = undefined;
+        let pagesFetched = 0;
+
+        setSyncProgress((prev) => ({
+          ...prev,
+          isRunning: true,
+          phaseLabel: 'Syncing inbox',
+        }));
+
+        while (syncRunIdRef.current === runId && pagesFetched < maxIncrementalPages) {
+          const page = await requestGmailSyncPageWithBackoff(
+            accessToken,
+            {
+              maxResults: 60,
+              pageToken,
+              excludeIds: Array.from(cachedIds),
+            },
+            runId
+          );
+
+          if (syncRunIdRef.current !== runId) return false;
+
+          pagesFetched += 1;
+
+          if (page.resultSizeEstimate > 0) {
+            totalEstimateRef.current = Math.max(
+              totalEstimateRef.current || 0,
+              page.resultSizeEstimate
+            );
+          }
+
+          // Preserve oldest pagination cursor so "Load Older Mail" continues seamlessly from where cache ends
+          if (isInitialEmptySync || !nextPageTokenRef.current) {
+            nextPageTokenRef.current = page.nextPageToken;
+          }
+
+          const freshMessages = page.messages.filter((m) => !cachedIds.has(m.id));
+          for (const m of freshMessages) cachedIds.add(m.id);
+
+          if (freshMessages.length > 0) {
+            const merged = deduplicateAndSortMessages([...freshMessages, ...messagesRef.current]);
+            setMessages(merged);
+            await saveCachedMessages(connected.email, freshMessages);
+            await classifyMessages(freshMessages, activeRules, activeFeedback, {
+              runId,
+              accountEmail: connected.email,
+              tokenOverride: accessToken,
+            });
+          }
+
+          if (page.rateLimited) {
             break;
           }
 
-          cursor = nextCursor;
+          // Stop incremental sync as soon as we reach already-cached mail
+          if (page.allPageCached || (!isInitialEmptySync && page.skippedCachedCount > 0)) {
+            break;
+          }
+
+          if (!page.nextPageToken) {
+            nextPageTokenRef.current = null;
+            break;
+          }
+
+          pageToken = page.nextPageToken;
         }
+
+        // Also ensure every currently loaded email obeys the latest strict rules
+        const latestMsgs = messagesRef.current;
+        if (latestMsgs.length > 0 && syncRunIdRef.current === runId) {
+          await classifyMessages(latestMsgs, activeRules, activeFeedback, {
+            runId,
+            accountEmail: connected.email,
+            tokenOverride: accessToken,
+          });
+        }
+
+        await saveCachedMeta({
+          accountEmail: connected.email,
+          nextPageToken: nextPageTokenRef.current,
+          totalEstimate: totalEstimateRef.current,
+          rulesVersion: CURRENT_RULES_VERSION,
+          lastSyncedAt: Date.now(),
+        });
+
+        setSyncProgress({
+          isRunning: false,
+          fetchedCount: messagesRef.current.length,
+          classifiedCount: messagesRef.current.filter((m) => Boolean(m.classification)).length,
+          totalEstimate: totalEstimateRef.current,
+          hasMore: Boolean(nextPageTokenRef.current),
+          phaseLabel: '',
+        });
 
         return true;
       } catch (err) {
         const msg =
-          err instanceof Error ? err.message : 'Failed to fetch emails from provider.';
+          err instanceof Error ? err.message : 'Unable to sync Gmail right now. Please try again.';
         setWorkspaceError(msg);
         return false;
       } finally {
         if (syncRunIdRef.current === runId) {
           setIsFetchingMail(false);
+          setIsLoadingOlder(false);
           setSyncProgress((prev) => ({
             ...prev,
             isRunning: false,
-            hasMore: Boolean(nextCursorRef.current),
+            hasMore: Boolean(nextPageTokenRef.current),
           }));
         }
       }
     },
-    [classifyMessages]
+    [classifyMessages, requestGmailSyncPageWithBackoff]
   );
 
   const handleStopSync = useCallback(() => {
     syncRunIdRef.current += 1;
     setIsFetchingMail(false);
+    setIsLoadingOlder(false);
     setIsClassifying(false);
+    setStatusMessage(null);
     setSyncProgress((prev) => ({
       ...prev,
       isRunning: false,
-      hasMore: Boolean(nextCursorRef.current),
-      phaseLabel: 'Paused',
+      hasMore: Boolean(nextPageTokenRef.current),
+      phaseLabel: '',
     }));
   }, []);
 
+  /**
+   * On-demand full email body loader: fetches format=full ONLY when the user clicks an email,
+   * re-runs strict classification if body reveals a Club/Survey/Volunteering/Academic signal,
+   * and saves the full HTML body + attachments to IndexedDB so future opens are instant.
+   */
   const handleEnsureFullMessage = useCallback(async (message: MailMessage) => {
     if (message.provider !== 'gmail' || message.fullBodyLoaded !== false) return;
     if (fullBodyInFlightRef.current.has(message.id)) return;
 
     const token = getGmailAccessToken();
-    if (!token) return;
+    if (!token) {
+      setStatusMessage('Showing cached inbox — click Sync Inbox to load full email content and new mail.');
+      return;
+    }
 
     fullBodyInFlightRef.current.add(message.id);
     setLoadingFullMessageId(message.id);
@@ -542,41 +772,34 @@ export default function App() {
         fullBodyLoaded?: boolean;
       };
 
-      setMessages((prev) =>
-        prev.map((m) => {
-          if (m.id !== message.id) return m;
-          const hydrated: MailMessage = {
-            ...m,
-            bodyText: data.bodyText ?? m.bodyText,
-            bodyHtml: data.bodyHtml,
-            attachments: data.attachments,
-            fullBodyLoaded: true,
-          };
-          // Re-check deterministic rules once full body loads (e.g., forwarded RVCE senders or "club" keyword in body)
-          if (
-            !hydrated.classification ||
-            hydrated.classification.categoryId === 'general' ||
-            hydrated.classification.categoryId === 'academic'
-          ) {
-            const directMatch = matchMessageDeterministically(hydrated, rulesRef.current);
-            if (
-              directMatch &&
-              (hydrated.classification?.categoryId !== 'academic' ||
-                directMatch.rule.id === 'surveys' ||
-                directMatch.rule.id === 'clubs' ||
-                directMatch.rule.id === 'volunteering')
-            ) {
-              hydrated.classification = {
-                categoryId: directMatch.rule.id,
-                confidence: 1.0,
-                matchedBy: 'directory',
-                reason: `Matched trained ${directMatch.rule.shortName} rule (${directMatch.matchedEntry}).`,
-              };
-            }
-          }
-          return hydrated;
-        })
-      );
+      const latestBase = messagesRef.current.find((m) => m.id === message.id) || message;
+      const hydrated: MailMessage = {
+        ...latestBase,
+        bodyText: data.bodyText ?? latestBase.bodyText,
+        bodyHtml: data.bodyHtml,
+        attachments: data.attachments,
+        fullBodyLoaded: true,
+      };
+
+      // Re-evaluate strict single-category rules now that the full body text is available
+      const directMatch = matchMessageDeterministically(hydrated, rulesRef.current);
+      if (directMatch) {
+        hydrated.classification = {
+          categoryId: directMatch.categoryId,
+          confidence: 1.0,
+          matchedBy: 'directory',
+          reason: directMatch.rule
+            ? `Matched ${directMatch.rule.shortName} (${directMatch.matchedEntry}).`
+            : `Routed to General Inbox (${directMatch.matchedEntry}).`,
+        };
+      }
+
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? hydrated : m)));
+
+      const acctEmail = accountRef.current?.email;
+      if (acctEmail) {
+        await saveCachedMessages(acctEmail, [hydrated]);
+      }
     } catch {
       // Keep snippet fallback cleanly if full hydration fails transiently
     } finally {
@@ -585,10 +808,10 @@ export default function App() {
     }
   }, []);
 
-  const fetchRef = useRef(fetchAndClassifyMail);
-  fetchRef.current = fetchAndClassifyMail;
+  const syncRef = useRef(syncInbox);
+  syncRef.current = syncInbox;
 
-  // Initialize Firebase Google Auth listener ONCE on mount (prevents duplicate fetches / state drops)
+  // Initialize Firebase Google Auth listener ONCE on mount
   useEffect(() => {
     const unsubscribe = initGoogleAuth(
       (user, token) => {
@@ -611,14 +834,68 @@ export default function App() {
           return nextAccount;
         });
         setAuthError(null);
-        fetchRef.current(nextAccount, { tokenOverride: token });
+        void syncRef.current(nextAccount, {
+          tokenOverride: token,
+          hydrateCacheFirst: true,
+        });
       },
       () => {
         setAccount((prev) => (prev?.provider === 'gmail' ? null : prev));
       },
-      allowedDomainsRef.current
+      allowedDomainsRef.current,
+      (restoredUser) => {
+        // Instant page-load opening from IndexedDB for an already signed-in campus user
+        const email = restoredUser.email || '';
+        if (!email || !isAllowedCampusEmail(email, allowedDomainsRef.current)) {
+          setAccount(null);
+          return;
+        }
+        void loadCachedMailbox(email).then(async ({ messages: cachedList, meta }) => {
+          if (cachedList.length === 0) {
+            // No cached mail yet — keep user on AuthLanding to authorize Gmail once
+            setAccount(null);
+            return;
+          }
+
+          const restoredAccount: ConnectedAccount = {
+            provider: 'gmail',
+            email,
+            displayName: restoredUser.displayName || email,
+            photoUrl: restoredUser.photoURL || undefined,
+          };
+          const deduped = deduplicateAndSortMessages(cachedList);
+          messagesRef.current = deduped;
+          if (meta?.nextPageToken) nextPageTokenRef.current = meta.nextPageToken;
+          if (meta?.totalEstimate) totalEstimateRef.current = meta.totalEstimate;
+
+          setAccount(restoredAccount);
+          setMessages(deduped);
+          setSyncProgress({
+            isRunning: false,
+            fetchedCount: deduped.length,
+            classifiedCount: deduped.filter((m) => Boolean(m.classification)).length,
+            totalEstimate: meta?.totalEstimate ?? null,
+            hasMore: Boolean(meta?.nextPageToken),
+            phaseLabel: '',
+          });
+
+          // Immediately re-run updated strict rules on cached emails if rules upgraded
+          if (meta?.rulesVersion !== CURRENT_RULES_VERSION) {
+            await classifyMessages(deduped, rulesRef.current, feedbackRef.current, {
+              accountEmail: email,
+            });
+            await saveCachedMeta({
+              accountEmail: email,
+              nextPageToken: meta?.nextPageToken ?? null,
+              totalEstimate: meta?.totalEstimate ?? null,
+              rulesVersion: CURRENT_RULES_VERSION,
+              lastSyncedAt: meta?.lastSyncedAt ?? Date.now(),
+            });
+          }
+        });
+      }
     );
-    // Handle standalone mobile redirect return if applicable
+
     void checkGoogleRedirectResult(allowedDomainsRef.current)
       .then((result) => {
         if (!result) return;
@@ -630,8 +907,10 @@ export default function App() {
         };
         setAccount(connected);
         setAuthError(null);
-        setShowTrainingView(false);
-        void fetchRef.current(connected, { tokenOverride: result.accessToken });
+        void syncRef.current(connected, {
+          tokenOverride: result.accessToken,
+          hydrateCacheFirst: true,
+        });
       })
       .catch((err) => {
         setAuthError(
@@ -642,59 +921,14 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Listen for Outlook / Yahoo OAuth popup postMessage completion
-  useEffect(() => {
-    const handleOAuthMessage = (event: MessageEvent) => {
-      const origin = event.origin;
-      if (!origin.endsWith('.run.app') && !origin.includes('localhost')) {
-        return;
-      }
-      const data = event.data;
-      if (!data || typeof data !== 'object') return;
-
-      if (data.type === 'OUTLOOK_OAUTH_SUCCESS' && data.accessToken && data.account) {
-        if (!isAllowedCampusEmail(data.account.email, allowedDomainsRef.current)) {
-          setIsLoggingIn(false);
-          setAuthError(buildCampusRestrictionError(data.account.email, allowedDomainsRef.current));
-          return;
-        }
-        thirdPartyTokenRef.current = data.accessToken;
-        const connected: ConnectedAccount = data.account;
-        setAccount(connected);
-        setAuthError(null);
-        setIsLoggingIn(false);
-        fetchRef.current(connected, { tokenOverride: data.accessToken });
-      } else if (data.type === 'YAHOO_OAUTH_SUCCESS' && data.accessToken && data.account) {
-        if (!isAllowedCampusEmail(data.account.email, allowedDomainsRef.current)) {
-          setIsLoggingIn(false);
-          setAuthError(buildCampusRestrictionError(data.account.email, allowedDomainsRef.current));
-          return;
-        }
-        thirdPartyTokenRef.current = data.accessToken;
-        const connected: ConnectedAccount = data.account;
-        setAccount(connected);
-        setAuthError(null);
-        setIsLoggingIn(false);
-        fetchRef.current(connected, { tokenOverride: data.accessToken });
-      } else if (data.type === 'OUTLOOK_OAUTH_ERROR' || data.type === 'YAHOO_OAUTH_ERROR') {
-        setIsLoggingIn(false);
-        setAuthError(data.error || 'Provider sign-in failed.');
-      }
-    };
-
-    window.addEventListener('message', handleOAuthMessage);
-    return () => window.removeEventListener('message', handleOAuthMessage);
-  }, []);
-
   const handleGoogleLogin = async (forceConsent = false) => {
     setIsLoggingIn(true);
     setAuthError(null);
     setWorkspaceError(null);
     try {
       const result = await googleSignIn(forceConsent, allowedDomainsRef.current);
-      if (!result) {
-        return;
-      }
+      if (!result) return;
+
       const connected: ConnectedAccount = {
         provider: 'gmail',
         email: result.user.email || 'campus-user',
@@ -702,8 +936,10 @@ export default function App() {
         photoUrl: result.user.photoURL || undefined,
       };
       setAccount(connected);
-      setShowTrainingView(false);
-      await fetchAndClassifyMail(connected, { tokenOverride: result.accessToken });
+      await syncInbox(connected, {
+        tokenOverride: result.accessToken,
+        hydrateCacheFirst: true,
+      });
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'College Google sign-in was cancelled or failed.';
@@ -713,158 +949,17 @@ export default function App() {
     }
   };
 
-  const handleThirdPartyOAuth = async (provider: 'outlook' | 'yahoo') => {
-    setIsLoggingIn(true);
-    setAuthError(null);
-    try {
-      const res = await fetch(`/api/auth/${provider}/url`);
-      const data = await res.json();
-      if (!res.ok || !data.url) {
-        throw new Error(data.message || `Could not initialize ${provider} sign-in.`);
-      }
-      const popup = window.open(data.url, `${provider}_oauth`, 'width=600,height=700');
-      if (!popup) {
-        throw new Error('Popup was blocked by your browser. Please allow popups and try again.');
-      }
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : `Failed to connect ${provider}.`);
-      setIsLoggingIn(false);
-    }
-  };
-
-  const handleImapLogin = async (creds: ImapCredentials) => {
-    setIsLoggingIn(true);
-    setAuthError(null);
-    setWorkspaceError(null);
-
-    if (!isAllowedCampusEmail(creds.email, allowedDomainsRef.current)) {
-      setAuthError(buildCampusRestrictionError(creds.email, allowedDomainsRef.current));
-      setIsLoggingIn(false);
-      return;
-    }
-
-    try {
-      // Verify credentials and load initial batch before switching into workspace
-      const res = await fetch('/api/imap/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: creds.email,
-          password: creds.password,
-          host: creds.host,
-          port: creds.port,
-          maxResults: 100,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Could not connect to your IMAP mailbox.');
-      }
-
-      imapCredentialsRef.current = creds;
-      const connected: ConnectedAccount = {
-        provider: 'imap',
-        email: creds.email,
-        displayName: creds.email.split('@')[0] || creds.email,
-        providerLabel: creds.providerLabel,
-      };
-      const fetched: MailMessage[] = Array.isArray(data.messages) ? data.messages : [];
-      const totalExists = typeof data.totalExists === 'number' ? data.totalExists : fetched.length;
-      const nextBeforeSeq = typeof data.nextBeforeSeq === 'number' ? data.nextBeforeSeq : null;
-
-      setAccount(connected);
-      setShowTrainingView(false);
-      setMessages(fetched);
-
-      if (nextBeforeSeq && nextBeforeSeq > 1) {
-        nextCursorRef.current = { provider: 'imap', beforeSeq: nextBeforeSeq };
-      } else {
-        nextCursorRef.current = null;
-      }
-
-      setSyncProgress({
-        isRunning: Boolean(nextBeforeSeq && nextBeforeSeq > 1),
-        fetchedCount: fetched.length,
-        classifiedCount: 0,
-        totalEstimate: totalExists,
-        hasMore: Boolean(nextBeforeSeq && nextBeforeSeq > 1),
-        phaseLabel: 'Categorizing mail',
-      });
-
-      if (fetched.length > 0) {
-        const classified = await classifyMessages(fetched, rulesRef.current, feedbackRef.current);
-        setSyncProgress((prev) => ({ ...prev, classifiedCount: classified }));
-      }
-
-      // Automatically continue syncing remaining IMAP pages in background
-      if (nextBeforeSeq && nextBeforeSeq > 1) {
-        void fetchAndClassifyMail(connected, { imapOverride: creds, resume: true });
-      }
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : 'Failed to connect via IMAP.');
-    } finally {
-      setIsLoggingIn(false);
-    }
-  };
-
-  const handleImportEmailFiles = async (fileList: FileList) => {
-    setIsLoggingIn(true);
-    setAuthError(null);
-    setWorkspaceError(null);
-
-    try {
-      const files: Array<{ name: string; content: string }> = [];
-      for (const file of Array.from(fileList)) {
-        const content = await file.text();
-        files.push({ name: file.name, content });
-      }
-
-      const res = await fetch('/api/import/emails', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ files }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Could not parse uploaded email files.');
-      }
-
-      const fetched: MailMessage[] = Array.isArray(data.messages) ? data.messages : [];
-      const connected: ConnectedAccount = {
-        provider: 'import',
-        email: `${fetched.length} imported message${fetched.length === 1 ? '' : 's'}`,
-        displayName: 'Imported Mailbox',
-        providerLabel: '.eml / .mbox',
-      };
-      setAccount(connected);
-      setShowTrainingView(false);
-      setMessages(fetched);
-      nextCursorRef.current = null;
-
-      if (fetched.length > 0) {
-        await classifyMessages(fetched, rulesRef.current, feedbackRef.current);
-      }
-    } catch (err) {
-      setAuthError(
-        err instanceof Error ? err.message : 'Failed to import uploaded email files.'
-      );
-    } finally {
-      setIsLoggingIn(false);
-    }
-  };
-
   const handleSignOut = async () => {
     syncRunIdRef.current += 1;
-    nextCursorRef.current = null;
+    nextPageTokenRef.current = null;
+    totalEstimateRef.current = null;
     if (account?.provider === 'gmail') {
       await googleLogout();
     }
-    thirdPartyTokenRef.current = null;
-    imapCredentialsRef.current = null;
     setAccount(null);
     setMessages([]);
     setWorkspaceError(null);
-    setShowTrainingView(false);
+    setStatusMessage(null);
     setSyncProgress({
       isRunning: false,
       fetchedCount: 0,
@@ -875,100 +970,25 @@ export default function App() {
     });
   };
 
-  const handleUpdateRules = (nextRules: ClassificationRule[]) => {
-    setRules(nextRules);
-    saveStoredRules(nextRules);
-  };
-
-  const handleResetRules = () => {
-    const defaults = resetStoredRules();
-    setRules(defaults);
-  };
-
-  const handleRemoveFeedback = (id: string) => {
-    const next = feedbackExamples.filter((ex) => ex.id !== id);
-    setFeedbackExamples(next);
-    saveStoredFeedback(next);
-  };
-
-  const handleReassignMessage = (
-    message: MailMessage,
-    newCategoryId: string,
-    addSenderToDirectory: boolean
-  ) => {
-    const targetRule = rules.find((r) => r.id === newCategoryId);
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === message.id
-          ? {
-              ...m,
-              classification: {
-                categoryId: newCategoryId,
-                confidence: 1.0,
-                matchedBy: 'user_feedback',
-                reason: targetRule
-                  ? `Manually assigned to ${targetRule.name} and saved to training model.`
-                  : 'Manually moved to General Inbox.',
-              },
-            }
-          : m
-      )
-    );
-
-    const example: TrainingFeedbackExample = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      fromEmail: message.fromEmail,
-      subject: message.subject,
-      snippet: message.snippet.slice(0, 140),
-      assignedCategoryId: newCategoryId,
-      createdAt: new Date().toISOString(),
-    };
-    const nextFeedback = [...feedbackExamples, example].slice(-50);
-    setFeedbackExamples(nextFeedback);
-    saveStoredFeedback(nextFeedback);
-
-    if (addSenderToDirectory && newCategoryId !== 'general' && message.fromEmail) {
-      const normalized = message.fromEmail.trim().toLowerCase();
-      const nextRules = rules.map((r) => {
-        if (r.id === newCategoryId) {
-          return {
-            ...r,
-            senders: Array.from(new Set([...r.senders, normalized])),
-          };
-        }
-        return {
-          ...r,
-          senders: r.senders.filter((s) => s.toLowerCase() !== normalized),
-        };
-      });
-      handleUpdateRules(nextRules);
-    }
-  };
-
   const handleToggleReadState = useCallback((messageId: string, unread: boolean) => {
+    const existing = messagesRef.current.find((m) => m.id === messageId);
+    const updatedMsg = existing ? { ...existing, unread } : null;
     setMessages((prev) =>
       prev.map((m) => (m.id === messageId ? { ...m, unread } : m))
     );
+    const acctEmail = accountRef.current?.email;
+    if (acctEmail && updatedMsg) {
+      void saveCachedMessages(acctEmail, [updatedMsg]);
+    }
   }, []);
 
   const handleDownloadAttachment = useCallback(
     async (message: MailMessage, attachment: MailAttachment) => {
-      const triggerBlobDownload = (blob: Blob, filename: string) => {
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = filename || 'attachment';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 1500);
-      };
-
       if (attachment.inlineDataBase64) {
-        const binaryStr = atob(attachment.inlineDataBase64);
-        const bytes = new Uint8Array(binaryStr.length);
-        for (let i = 0; i < binaryStr.length; i++) {
-          bytes[i] = binaryStr.charCodeAt(i);
+        const binary = atob(attachment.inlineDataBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
         }
         const blob = new Blob([bytes], {
           type: attachment.mimeType || 'application/octet-stream',
@@ -980,7 +1000,7 @@ export default function App() {
       if (message.provider === 'gmail') {
         const token = getGmailAccessToken();
         if (!token) {
-          throw new Error('Your Gmail session expired. Click Re-authorize Gmail to download files.');
+          throw new Error('Your Gmail session expired. Click Re-authorize Gmail to download attachments.');
         }
 
         const params = new URLSearchParams({
@@ -998,7 +1018,7 @@ export default function App() {
         );
 
         if (!res.ok) {
-          let errMsg = `Failed to download attachment (${res.status}).`;
+          let errMsg = 'Failed to download attachment.';
           try {
             const errJson = (await res.json()) as { error?: string };
             if (errJson.error) errMsg = errJson.error;
@@ -1018,24 +1038,6 @@ export default function App() {
     []
   );
 
-  if (showTrainingView) {
-    return (
-      <TrainingStudio
-        rules={rules}
-        feedbackExamples={feedbackExamples}
-        initialTab={trainingInitialTab}
-        isAuthenticated={Boolean(account)}
-        onBack={() => setShowTrainingView(false)}
-        onUpdateRules={handleUpdateRules}
-        onResetRules={handleResetRules}
-        onRemoveFeedback={handleRemoveFeedback}
-        onReclassifyInbox={
-          account ? () => classifyMessages(messages, rules, feedbackExamples) : undefined
-        }
-      />
-    );
-  }
-
   if (!account) {
     return (
       <AuthLanding
@@ -1052,30 +1054,17 @@ export default function App() {
       messages={messages}
       rules={rules}
       isFetchingMail={isFetchingMail}
+      isLoadingOlder={isLoadingOlder}
       isClassifying={isClassifying}
       syncProgress={syncProgress}
       loadingFullMessageId={loadingFullMessageId}
+      statusMessage={statusMessage}
       errorMessage={workspaceError}
-      onSyncMail={() => fetchAndClassifyMail(account)}
+      onSyncInbox={() => syncInbox(account)}
       onStopSync={handleStopSync}
-      onResumeSync={() => fetchAndClassifyMail(account, { resume: true })}
-      onSyncRvceMail={
-        account.provider === 'gmail'
-          ? () =>
-              fetchAndClassifyMail(account, {
-                gmailQuery:
-                  'rvce.edu.in OR rvei.edu.in OR mathworks OR volunteering OR nss OR ncc OR club OR survey',
-              })
-          : undefined
-      }
-      onRunClassify={() => classifyMessages(messages, rules, feedbackExamples)}
+      onLoadOlderMail={() => syncInbox(account, { loadOlderOnly: true })}
       onReauthorizeGmail={() => handleGoogleLogin(true)}
       onSignOut={handleSignOut}
-      onOpenTraining={(tab = 'rules') => {
-        setTrainingInitialTab(tab);
-        setShowTrainingView(true);
-      }}
-      onReassignMessage={handleReassignMessage}
       onToggleReadState={handleToggleReadState}
       onDownloadAttachment={handleDownloadAttachment}
       onEnsureFullMessage={handleEnsureFullMessage}

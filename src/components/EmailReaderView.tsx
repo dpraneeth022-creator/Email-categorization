@@ -15,15 +15,11 @@ import {
   Minimize2,
   Paperclip,
 } from 'lucide-react';
-import type {
-  ClassificationRule,
-  MailAttachment,
-  MailMessage,
-} from '../shared/types';
+import { decodeHtmlEntities } from '../shared/classifierRules';
+import type { MailAttachment, MailMessage } from '../shared/types';
 
 interface EmailReaderViewProps {
   message: MailMessage;
-  rules: ClassificationRule[];
   currentIndex: number;
   totalCount: number;
   isExpanded: boolean;
@@ -33,11 +29,6 @@ interface EmailReaderViewProps {
   onSelectPrevious: () => void;
   onSelectNext: () => void;
   onToggleReadState: (messageId: string, unread: boolean) => void;
-  onReassignMessage: (
-    message: MailMessage,
-    newCategoryId: string,
-    addSenderToDirectory: boolean
-  ) => void;
   onDownloadAttachment: (message: MailMessage, attachment: MailAttachment) => Promise<void>;
 }
 
@@ -59,6 +50,43 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Splits a raw RFC-2822 To: header into individual recipient strings while respecting
+ * commas inside quoted display names (e.g. "Last, First" <a@rvce.edu.in>, b@rvce.edu.in).
+ */
+function parseRecipientList(rawTo?: string): string[] {
+  if (!rawTo || !rawTo.trim()) return [];
+  const decoded = decodeHtmlEntities(rawTo);
+  const recipients: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  let angleDepth = 0;
+
+  for (let i = 0; i < decoded.length; i++) {
+    const ch = decoded[i];
+    if (ch === '"' && decoded[i - 1] !== '\\') {
+      inQuotes = !inQuotes;
+      current += ch;
+    } else if (!inQuotes && ch === '<') {
+      angleDepth += 1;
+      current += ch;
+    } else if (!inQuotes && ch === '>' && angleDepth > 0) {
+      angleDepth -= 1;
+      current += ch;
+    } else if (!inQuotes && angleDepth === 0 && (ch === ',' || ch === ';')) {
+      const cleaned = current.trim();
+      if (cleaned) recipients.push(cleaned);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  const trailing = current.trim();
+  if (trailing) recipients.push(trailing);
+
+  return recipients;
 }
 
 function buildSandboxedHtmlDoc(bodyHtml: string): string {
@@ -146,7 +174,6 @@ function renderLinkifiedText(text: string): React.ReactNode[] {
 
 export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
   message,
-  rules,
   currentIndex,
   totalCount,
   isExpanded,
@@ -156,24 +183,21 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
   onSelectPrevious,
   onSelectNext,
   onToggleReadState,
-  onReassignMessage,
   onDownloadAttachment,
 }) => {
   const hasHtml = Boolean(message.bodyHtml && message.bodyHtml.trim().length > 0);
-  const [viewMode, setViewMode] = useState<'html' | 'text'>(hasHtml ? 'html' : 'text');
   const [iframeHeight, setIframeHeight] = useState<number>(420);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
-  const [addSenderOnMove, setAddSenderOnMove] = useState(true);
-  const [moveFeedbackMsg, setMoveFeedbackMsg] = useState<string | null>(null);
+  const [showAllRecipients, setShowAllRecipients] = useState(false);
   const [copiedSender, setCopiedSender] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
-  // Reset reader view state whenever the opened email changes
+  // Reset reader state whenever the opened email changes
   useEffect(() => {
-    setViewMode(Boolean(message.bodyHtml && message.bodyHtml.trim()) ? 'html' : 'text');
     setIframeHeight(420);
+    setShowAllRecipients(false);
     setDownloadError(null);
     setCopiedSender(false);
   }, [message.id, message.bodyHtml]);
@@ -182,6 +206,16 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
     if (!message.bodyHtml) return '';
     return buildSandboxedHtmlDoc(message.bodyHtml);
   }, [message.bodyHtml]);
+
+  const recipients = useMemo(() => parseRecipientList(message.to), [message.to]);
+  const cleanSubject = useMemo(
+    () => decodeHtmlEntities(message.subject || '(No Subject)'),
+    [message.subject]
+  );
+  const cleanFromName = useMemo(
+    () => decodeHtmlEntities(message.fromName || message.fromEmail || 'Unknown sender'),
+    [message.fromName, message.fromEmail]
+  );
 
   const measureIframeHeight = () => {
     const iframe = iframeRef.current;
@@ -196,7 +230,6 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
       );
       setIframeHeight(Math.min(measured + 28, 6000));
     } catch {
-      // Fallback height if browser restricts measurement
       setIframeHeight(560);
     }
   };
@@ -216,24 +249,8 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
       }
       setTimeout(measureIframeHeight, 180);
     } catch {
-      // Ignore if cross-origin
+      // Ignore cross-origin
     }
-  };
-
-  const matchedRule = rules.find((r) => r.id === message.classification?.categoryId);
-
-  const handleMove = (newCategoryId: string) => {
-    onReassignMessage(message, newCategoryId, addSenderOnMove);
-    const targetName =
-      newCategoryId === 'general'
-        ? 'General Inbox'
-        : rules.find((r) => r.id === newCategoryId)?.name || newCategoryId;
-    setMoveFeedbackMsg(
-      addSenderOnMove && newCategoryId !== 'general'
-        ? `Moved to ${targetName} and saved sender to trained rules.`
-        : `Moved to ${targetName} and recorded as training feedback.`
-    );
-    setTimeout(() => setMoveFeedbackMsg(null), 3200);
   };
 
   const handleCopySender = async () => {
@@ -243,7 +260,7 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
       setCopiedSender(true);
       setTimeout(() => setCopiedSender(false), 1800);
     } catch {
-      // Clipboard blocked in sandboxed context; fail quietly
+      // Clipboard blocked in sandboxed context
     }
   };
 
@@ -271,12 +288,14 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
       ? 'Open in Outlook'
       : 'Open Original';
 
+  const firstRecipient = recipients[0] || '';
+  const extraRecipientCount = Math.max(0, recipients.length - 1);
+
   return (
     <div className="flex-1 flex flex-col bg-slate-50 min-w-0 h-full overflow-hidden">
       {/* Top Reader Toolbar */}
       <div className="h-12 bg-white border-b border-slate-200 px-3 sm:px-5 flex items-center justify-between gap-2 shrink-0">
         <div className="flex items-center gap-1.5 min-w-0">
-          {/* Mobile Back to Inbox button */}
           <button
             type="button"
             onClick={onBackMobile}
@@ -286,7 +305,6 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
             <span>Back</span>
           </button>
 
-          {/* Desktop Expand / Split View toggle */}
           <button
             type="button"
             onClick={onToggleExpand}
@@ -308,7 +326,6 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
 
           <span className="h-4 w-px bg-slate-200 mx-0.5 hidden sm:inline-block" aria-hidden="true" />
 
-          {/* Prev / Next Navigation */}
           <div className="inline-flex items-center gap-0.5">
             <button
               type="button"
@@ -376,144 +393,25 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
       {/* Scrollable Email Content Canvas */}
       <div className="flex-1 overflow-y-auto mail-scroll p-4 sm:p-6 lg:p-8">
         <div
-          className={`mx-auto space-y-5 transition-[max-width] duration-150 ${
+          className={`mx-auto transition-[max-width] duration-150 ${
             isExpanded ? 'max-w-5xl' : 'max-w-3xl'
           }`}
         >
-          {/* Classification Inspector & Move/Train Bar */}
-          <section className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5 space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="font-semibold text-slate-950">
-                  {matchedRule?.name || 'GENERAL INBOX'}
-                </span>
-                <span className="text-slate-300" aria-hidden="true">
-                  ·
-                </span>
-                <span className="text-slate-600">
-                  {message.classification?.matchedBy === 'directory'
-                    ? 'Sender Directory Match'
-                    : message.classification?.matchedBy === 'user_feedback'
-                    ? 'User Trained Correction'
-                    : 'Gemini Semantic Classification'}
-                </span>
-                {message.classification && (
-                  <>
-                    <span className="text-slate-300" aria-hidden="true">
-                      ·
-                    </span>
-                    <span className="font-mono tabular-nums text-slate-600">
-                      {Math.round(message.classification.confidence * 100)}% confidence
-                    </span>
-                  </>
-                )}
-              </div>
-            </div>
-
-            {message.classification?.reason && (
-              <p className="text-xs text-slate-600 leading-relaxed">
-                {message.classification.reason}
-              </p>
-            )}
-
-            <div className="pt-3 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-xs text-slate-500 mr-1">Move &amp; train as:</span>
-                {rules.map((rule) => {
-                  const isCurrent = message.classification?.categoryId === rule.id;
-                  return (
-                    <button
-                      key={rule.id}
-                      type="button"
-                      disabled={isCurrent}
-                      onClick={() => handleMove(rule.id)}
-                      className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
-                        isCurrent
-                          ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-default'
-                          : 'bg-white border-slate-200 text-slate-700 hover:border-slate-400 hover:text-slate-950'
-                      }`}
-                    >
-                      {rule.shortName}
-                    </button>
-                  );
-                })}
-                <button
-                  type="button"
-                  disabled={(message.classification?.categoryId || 'general') === 'general'}
-                  onClick={() => handleMove('general')}
-                  className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
-                    (message.classification?.categoryId || 'general') === 'general'
-                      ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-default'
-                      : 'bg-white border-slate-200 text-slate-700 hover:border-slate-400 hover:text-slate-950'
-                  }`}
-                >
-                  General
-                </button>
-              </div>
-
-              <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-600 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={addSenderOnMove}
-                  onChange={(e) => setAddSenderOnMove(e.target.checked)}
-                  className="rounded border-slate-300 text-blue-700"
-                />
-                Remember sender address
-              </label>
-            </div>
-
-            {moveFeedbackMsg && (
-              <div className="text-xs text-emerald-700 font-medium inline-flex items-center gap-1.5">
-                <Check className="w-3.5 h-3.5" />
-                <span>{moveFeedbackMsg}</span>
-              </div>
-            )}
-          </section>
-
-          {/* Main Email Document Card */}
+          {/* Clean Main Email Document Card */}
           <article className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-            {/* Subject & Envelope Header */}
-            <header className="p-5 sm:p-6 lg:p-8 pb-5 border-b border-slate-200 space-y-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <h2
-                  className="text-lg sm:text-xl font-bold text-slate-950 leading-snug flex-1 min-w-0"
-                  style={{ textWrap: 'balance' }}
-                >
-                  {message.subject}
-                </h2>
-
-                {hasHtml && (
-                  <div className="inline-flex items-center gap-0.5 p-0.5 bg-slate-100 rounded-md shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => setViewMode('html')}
-                      className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap cursor-pointer ${
-                        viewMode === 'html'
-                          ? 'bg-white text-slate-950 shadow-2xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      Rich View
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setViewMode('text')}
-                      className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap cursor-pointer ${
-                        viewMode === 'text'
-                          ? 'bg-white text-slate-950 shadow-2xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      Plain Text
-                    </button>
-                  </div>
-                )}
-              </div>
+            {/* Subject & Compact Envelope Header */}
+            <header className="p-5 sm:p-6 lg:p-8 pb-5 border-b border-slate-200 space-y-3.5">
+              <h2
+                className="text-lg sm:text-xl font-bold text-slate-950 leading-snug"
+                style={{ textWrap: 'balance' }}
+              >
+                {cleanSubject}
+              </h2>
 
               <div className="flex flex-wrap items-start justify-between gap-3 text-xs">
-                <div className="space-y-1 min-w-0">
+                <div className="space-y-1 min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="font-semibold text-slate-900">{message.fromName}</span>
+                    <span className="font-semibold text-slate-900">{cleanFromName}</span>
                     {message.fromEmail && (
                       <span className="font-mono text-slate-500 break-all">
                         &lt;{message.fromEmail}&gt;
@@ -540,14 +438,50 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
                       </button>
                     )}
                   </div>
-                  {message.replyTo && message.replyTo !== message.fromEmail && (
-                    <div className="text-slate-500 break-all">
-                      Reply-To: <span className="font-mono">{message.replyTo}</span>
-                    </div>
-                  )}
-                  {message.to && (
-                    <div className="text-slate-500 break-all">
-                      To: <span className="font-mono">{message.to}</span>
+
+                  {/* Compact collapsible To: recipient line */}
+                  {recipients.length > 0 && (
+                    <div className="text-slate-500 leading-relaxed">
+                      {!showAllRecipients ? (
+                        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                          <span className="shrink-0">To:</span>
+                          <span className="font-mono text-slate-600 truncate max-w-[320px] sm:max-w-[420px]">
+                            {firstRecipient}
+                          </span>
+                          {extraRecipientCount > 0 && (
+                            <>
+                              <span className="font-medium text-slate-600 whitespace-nowrap">
+                                + {extraRecipientCount} {extraRecipientCount === 1 ? 'other' : 'others'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setShowAllRecipients(true)}
+                                className="text-blue-700 hover:text-blue-900 font-medium underline underline-offset-2 whitespace-nowrap cursor-pointer"
+                              >
+                                Show all
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-medium text-slate-600">
+                              To ({recipients.length} recipients):
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setShowAllRecipients(false)}
+                              className="text-blue-700 hover:text-blue-900 font-medium underline underline-offset-2 whitespace-nowrap cursor-pointer"
+                            >
+                              Hide
+                            </button>
+                          </div>
+                          <div className="font-mono text-[11px] text-slate-600 break-all bg-slate-50 border border-slate-200 rounded-lg p-2.5 max-h-36 overflow-y-auto mail-scroll">
+                            {recipients.join(', ')}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -620,19 +554,19 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
               </div>
             )}
 
-            {/* Email Body Content */}
+            {/* Email Body Content — always renders original HTML cleanly, falling back to plain text only if no HTML */}
             <div className="p-5 sm:p-6 lg:p-8 space-y-4">
               {isLoadingFullBody && (
                 <div className="flex items-center gap-2 text-xs text-slate-500">
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-700 shrink-0" />
-                  <span>Loading full formatted message and attachments...</span>
+                  <span>Loading full message...</span>
                 </div>
               )}
 
-              {hasHtml && viewMode === 'html' ? (
+              {hasHtml ? (
                 <iframe
                   ref={iframeRef}
-                  title={`Email content: ${message.subject}`}
+                  title={`Email content: ${cleanSubject}`}
                   srcDoc={sandboxedSrcDoc}
                   onLoad={handleIframeLoad}
                   sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
@@ -642,7 +576,9 @@ export const EmailReaderView: React.FC<EmailReaderViewProps> = ({
               ) : (
                 <div className="text-[15px] text-slate-800 leading-[1.7] whitespace-pre-wrap break-words max-w-[72ch]">
                   {renderLinkifiedText(
-                    message.bodyText || message.snippet || '(Empty message body)'
+                    decodeHtmlEntities(
+                      message.bodyText || message.snippet || '(Empty message body)'
+                    )
                   )}
                 </div>
               )}
